@@ -259,6 +259,80 @@ export class LPClient {
     }
 
     /**
+     * Calculate the token ratio needed for an LP position in a given range.
+     * 
+     * For CLMM, the ratio depends on where current price sits within the range.
+     * Returns the fraction of value that should be in tokenA (TSLAx).
+     * 
+     * @param rangePercent - Range width as a decimal (e.g., 0.05 for ±5%)
+     * @returns tokenARatio - Fraction of LP value that should be tokenA (0 to 1)
+     */
+    calculateTokenRatio(rangePercent: number = config.RANGE_WIDTH_PERCENT): {
+        tokenARatio: number;
+        tokenBRatio: number;
+        lowerTick: number;
+        upperTick: number;
+    } {
+        if (!this.poolInfo) {
+            throw new Error('Pool info not loaded');
+        }
+
+        const { lowerTick, upperTick } = this.calculateRangeTicks(rangePercent);
+
+        // Convert ticks to sqrt prices
+        // sqrtPrice = 1.0001^(tick/2)
+        const sqrtPriceLower = Math.pow(1.0001, lowerTick / 2);
+        const sqrtPriceUpper = Math.pow(1.0001, upperTick / 2);
+        const sqrtPriceCurrent = Number(this.poolInfo.sqrtPriceX64) / Math.pow(2, 64);
+
+        // CLMM liquidity math for in-range position:
+        // amount0 (tokenA) = L * (1/sqrtP - 1/sqrtPu)
+        // amount1 (tokenB) = L * (sqrtP - sqrtPl)
+        // 
+        // For value ratio, we need:
+        // valueA = amount0 * price = L * (1/sqrtP - 1/sqrtPu) * P = L * (sqrtP - P/sqrtPu)
+        // valueB = amount1 = L * (sqrtP - sqrtPl)
+        //
+        // Simplified for ratio calculation (L cancels out):
+        const p = sqrtPriceCurrent * sqrtPriceCurrent; // current price
+
+        // Handle edge cases
+        if (sqrtPriceCurrent <= sqrtPriceLower) {
+            // Price below range: 100% tokenA
+            return { tokenARatio: 1, tokenBRatio: 0, lowerTick, upperTick };
+        }
+        if (sqrtPriceCurrent >= sqrtPriceUpper) {
+            // Price above range: 100% tokenB
+            return { tokenARatio: 0, tokenBRatio: 1, lowerTick, upperTick };
+        }
+
+        // In range: calculate actual ratio
+        // amount0 proportional to: (sqrtPu - sqrtP) / (sqrtP * sqrtPu)
+        // amount1 proportional to: (sqrtP - sqrtPl)
+        const amount0Factor = (sqrtPriceUpper - sqrtPriceCurrent) / (sqrtPriceCurrent * sqrtPriceUpper);
+        const amount1Factor = sqrtPriceCurrent - sqrtPriceLower;
+
+        // Value in tokenB terms (amount0 * price + amount1)
+        const valueAInB = amount0Factor * p;
+        const valueB = amount1Factor;
+        const totalValue = valueAInB + valueB;
+
+        const tokenARatio = valueAInB / totalValue;
+        const tokenBRatio = valueB / totalValue;
+
+        log.info({
+            event: 'calculated_token_ratio',
+            tokenARatio: tokenARatio.toFixed(4),
+            tokenBRatio: tokenBRatio.toFixed(4),
+            sqrtPriceCurrent: sqrtPriceCurrent.toFixed(6),
+            sqrtPriceLower: sqrtPriceLower.toFixed(6),
+            sqrtPriceUpper: sqrtPriceUpper.toFixed(6),
+        });
+
+        return { tokenARatio, tokenBRatio, lowerTick, upperTick };
+    }
+
+    /**
      * Fetch user's LP positions.
      */
     async fetchPositions(): Promise<LPPosition[]> {

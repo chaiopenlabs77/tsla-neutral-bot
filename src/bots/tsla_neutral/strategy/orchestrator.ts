@@ -447,22 +447,35 @@ export class Orchestrator {
             return false;
         }
 
-        // Calculate capital allocation:
-        // - LP needs: $L/2 for TSLAx swap + $L/2 for USDC side = $L total
-        // - Hedge needs: $L/leverage for collateral (e.g., 2x leverage = 50%)
-        // - Total: $L * (1 + 1/leverage)
-        // - So: LP value = totalCapital / (1 + 1/leverage)
+        // Calculate capital allocation using ratio-aware LP math:
+        // First, determine what % of LP value should be TSLAx vs USDC based on tick range
+        const { tokenARatio, tokenBRatio } = this.lpClient.calculateTokenRatio(rangePercent);
+
+        // LP value = total capital minus hedge collateral
+        // Hedge collateral = LP value / leverage
+        // So: LP value = totalCapital / (1 + 1/leverage)
         const lpValueUsd = totalCapitalUsd / (1 + 1 / leverage);
         const hedgeCollateralUsd = lpValueUsd / leverage;
-        const swapAmountUsd = lpValueUsd / 2; // Half goes to TSLAx
-        const lpUsdcSideUsd = lpValueUsd / 2; // Half stays as USDC for LP
+
+        // Now split LP value according to actual ratio
+        const targetTslaxUsd = lpValueUsd * tokenARatio;
+        const targetUsdcForLp = lpValueUsd * tokenBRatio;
+
+        // Add slippage buffer (2%) - swap slightly more to ensure we have enough
+        const slippageBuffer = 1.02;
+        const swapAmountUsd = targetTslaxUsd * slippageBuffer;
 
         log.info({
             event: 'bootstrap_starting',
             walletUsdcBalance: totalCapitalUsd.toFixed(2),
             lpValueUsd: lpValueUsd.toFixed(2),
             hedgeCollateralUsd: hedgeCollateralUsd.toFixed(2),
+            tokenARatio: tokenARatio.toFixed(4),
+            tokenBRatio: tokenBRatio.toFixed(4),
+            targetTslaxUsd: targetTslaxUsd.toFixed(2),
+            targetUsdcForLp: targetUsdcForLp.toFixed(2),
             swapAmountUsd: swapAmountUsd.toFixed(2),
+            slippageBuffer,
             leverage,
             currentPrice,
             rangePercent,
@@ -490,17 +503,14 @@ export class Orchestrator {
             // TSLAx has 8 decimals - calculate existing value in USD
             const existingTslaxUsd = (Number(existingTslax) / 1e8) * currentPrice;
 
-            // Calculate target TSLAx amount for LP (half of LP value)
-            const targetTslaxUsd = swapAmountUsd; // This is lpValueUsd / 2
-
-            // Calculate delta - how much more TSLAx we need
-            const deltaUsd = targetTslaxUsd - existingTslaxUsd;
+            // Delta = how much more TSLAx we need (targetTslaxUsd already includes slippage buffer)
+            const deltaUsd = swapAmountUsd - existingTslaxUsd;
 
             log.info({
                 event: 'bootstrap_capital_check',
                 existingTslaxRaw: existingTslax.toString(),
                 existingTslaxUsd: existingTslaxUsd.toFixed(2),
-                targetTslaxUsd: targetTslaxUsd.toFixed(2),
+                targetTslaxUsd: swapAmountUsd.toFixed(2),
                 deltaUsd: deltaUsd.toFixed(2),
             });
 

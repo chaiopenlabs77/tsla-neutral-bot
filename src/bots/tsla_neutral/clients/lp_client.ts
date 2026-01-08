@@ -398,8 +398,18 @@ export class LPClient {
 
         try {
             // Build open position transaction
+            // SDK v2 returns { poolInfo, poolKeys } - we need the poolInfo object
+            const poolData = await this.raydium.clmm.getPoolInfoFromRpc(this.poolAddress.toBase58());
+
+            log.info({
+                event: 'pool_data_for_open',
+                hasPoolInfo: !!poolData.poolInfo,
+                hasPoolKeys: !!poolData.poolKeys,
+            });
+
             const { execute, extInfo } = await this.raydium.clmm.openPositionFromBase({
-                poolInfo: await this.raydium.clmm.getPoolInfoFromRpc(this.poolAddress.toBase58()),
+                poolInfo: poolData.poolInfo,
+                poolKeys: poolData.poolKeys,
                 ownerInfo: {
                     useSOLBalance: true,
                 },

@@ -130,23 +130,53 @@ export class LPClient {
                 hasPoolData: !!poolData,
             });
 
+            // Debug: Log raw pool properties to understand SDK response
+            log.info({
+                event: 'pool_data_debug',
+                sqrtPriceX64: poolData?.sqrtPriceX64?.toString(),
+                tickCurrent: poolData?.tickCurrent,
+                liquidity: poolData?.liquidity?.toString(),
+                tickSpacing: poolData?.config?.tickSpacing,
+            });
+
             if (!poolData) {
                 throw new Error('Pool not found or RPC returned empty response');
             }
 
-            // Handle different SDK response formats
-            // v2 SDK may use different property names
-            const mintA = poolData.mintA?.address || poolData.mintA?.mint || poolData.mintA;
-            const mintB = poolData.mintB?.address || poolData.mintB?.mint || poolData.mintB;
-            const tickSpacing = poolData.config?.tickSpacing || poolData.tickSpacing || 1;
-            const sqrtPriceX64 = poolData.sqrtPriceX64 || poolData.currentPrice || '0';
-            const tickCurrent = poolData.tickCurrent ?? poolData.currentTickIndex ?? 0;
-            const liquidity = poolData.liquidity || '0';
+            // SDK v2 returns { poolInfo, poolKeys, computePoolInfo, tickData }
+            // Extract the actual pool info from the nested structure
+            const pi = poolData.poolInfo || poolData;
+            const computeInfo = poolData.computePoolInfo;
+
+            log.info({
+                event: 'pool_data_structure',
+                hasPoolInfo: !!poolData.poolInfo,
+                hasComputePoolInfo: !!computeInfo,
+                computePoolInfoKeys: Object.keys(computeInfo || {}),
+            });
+
+            // Get mint info
+            const mintA = pi.mintA?.address || pi.mintA?.programId ? pi.mintA : null;
+            const mintB = pi.mintB?.address || pi.mintB?.programId ? pi.mintB : null;
+
+            // Get pool state - prefer computePoolInfo for current values
+            const tickSpacing = pi.config?.tickSpacing || pi.tickSpacing || 1;
+            const sqrtPriceX64 = computeInfo?.sqrtPriceX64 || pi.sqrtPriceX64 || '0';
+            const tickCurrent = computeInfo?.tickCurrent ?? pi.tickCurrent ?? 0;
+            const liquidity = computeInfo?.liquidity || pi.liquidity || '0';
+
+            log.info({
+                event: 'parsed_pool_values',
+                sqrtPriceX64: sqrtPriceX64.toString(),
+                tickCurrent,
+                liquidity: liquidity.toString(),
+                tickSpacing,
+            });
 
             this.poolInfo = {
                 id: this.poolAddress,
-                mintA: typeof mintA === 'string' ? new PublicKey(mintA) : mintA,
-                mintB: typeof mintB === 'string' ? new PublicKey(mintB) : mintB,
+                mintA: mintA?.address ? new PublicKey(mintA.address) : new PublicKey(config.TSLAX_MINT),
+                mintB: mintB?.address ? new PublicKey(mintB.address) : new PublicKey(config.USDC_MINT),
                 tickSpacing,
                 sqrtPriceX64: BigInt(sqrtPriceX64.toString()),
                 currentTickIndex: tickCurrent,

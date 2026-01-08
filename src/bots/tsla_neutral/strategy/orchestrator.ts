@@ -11,7 +11,7 @@ import { getRpcManager } from '../clients/rpc_manager';
 import { evaluateRebalance } from './risk_manager';
 import { loggers, logMetricsSnapshot } from '../observability/logger';
 import { rebalanceCounter } from '../observability/metrics';
-import { alerts } from '../observability/alerter';
+import { alerts, alertInfo, alertWarning } from '../observability/alerter';
 import { isShutdownInProgress, onShutdown } from '../utils/shutdown';
 import { sleep, Backoff } from '../utils/backoff';
 import { getMonotonicTime } from '../utils/clock';
@@ -250,16 +250,114 @@ export class Orchestrator {
 
             rebalanceCounter.inc({ reason: decision.reason, status: 'pending' });
 
-            // TODO: Execute actual rebalance trades
-            // For now, just log what we would do
-            log.info({
-                event: 'would_execute_rebalance',
-                action: decision.sizeToAdjust > 0 ? 'increase_short' : 'decrease_short',
-                sizeUsd: Math.abs(decision.sizeToAdjust)
-            });
+            // Execute the rebalance
+            const success = await this.executeRebalance(decision.sizeToAdjust, tslaPrice);
+
+            if (success) {
+                rebalanceCounter.inc({ reason: decision.reason, status: 'success' });
+            } else {
+                rebalanceCounter.inc({ reason: decision.reason, status: 'failure' });
+            }
         }
 
         this.state = await recordSuccess(this.state);
+    }
+
+    /**
+     * Execute a rebalance trade.
+     * @param sizeToAdjust - Positive = need more short, negative = need less short
+     * @param currentPrice - Current TSLA price for calculations
+     */
+    private async executeRebalance(sizeToAdjust: number, currentPrice: number): Promise<boolean> {
+        if (!this.flashTradeClient) {
+            log.error({ event: 'rebalance_failed', error: 'Flash Trade client not initialized' });
+            return false;
+        }
+
+        const absSize = Math.abs(sizeToAdjust);
+
+        // Skip tiny adjustments
+        if (absSize < config.MIN_REBALANCE_SIZE_USD) {
+            log.info({
+                event: 'rebalance_skipped',
+                reason: 'below_min_size',
+                size: absSize,
+                minSize: config.MIN_REBALANCE_SIZE_USD
+            });
+            return true; // Not a failure, just skipped
+        }
+
+        // Cap position size
+        const cappedSize = Math.min(absSize, config.MAX_POSITION_SIZE_USD);
+
+        try {
+            if (sizeToAdjust > 0) {
+                // Need MORE hedge -> open/increase short position
+                log.info({
+                    event: 'opening_short',
+                    sizeUsd: cappedSize,
+                    leverage: config.DEFAULT_LEVERAGE,
+                });
+
+                // Calculate collateral: size / leverage
+                const collateralUsd = Math.max(
+                    cappedSize / config.DEFAULT_LEVERAGE,
+                    config.MIN_COLLATERAL_USD
+                );
+
+                const result = await this.flashTradeClient.openShortPosition(
+                    cappedSize,
+                    collateralUsd,
+                    config.MAX_SLIPPAGE_BPS
+                );
+
+                if (result) {
+                    log.info({
+                        event: 'short_opened',
+                        txSignature: result.txSignature,
+                        sizeUsd: cappedSize,
+                        collateralUsd,
+                    });
+                    alertInfo('REBALANCE_EXECUTED', `Opened short: $${cappedSize} (tx: ${result.txSignature.slice(0, 8)}...)`);
+                    return true;
+                } else {
+                    log.error({ event: 'short_open_failed', sizeUsd: cappedSize });
+                    alertWarning('REBALANCE_FAILED', `Failed to open short: $${cappedSize}`);
+                    return false;
+                }
+            } else {
+                // Need LESS hedge -> close/reduce short position
+                log.info({
+                    event: 'closing_short',
+                    sizeUsd: cappedSize,
+                });
+
+                // For now, close the entire position
+                // TODO: Support partial closes when SDK supports it
+                const result = await this.flashTradeClient.closePosition(config.MAX_SLIPPAGE_BPS);
+
+                if (result) {
+                    log.info({
+                        event: 'short_closed',
+                        txSignature: result.txSignature,
+                    });
+                    alertInfo('REBALANCE_EXECUTED', `Closed short (tx: ${result.txSignature.slice(0, 8)}...)`);
+                    return true;
+                } else {
+                    log.error({ event: 'short_close_failed' });
+                    alertWarning('REBALANCE_FAILED', 'Failed to close short position');
+                    return false;
+                }
+            }
+        } catch (error) {
+            log.error({
+                event: 'rebalance_execution_error',
+                error: error instanceof Error ? error.message : String(error),
+                sizeToAdjust,
+            });
+            alerts.txFailure('rebalance', error instanceof Error ? error.message : String(error));
+            return false;
+        }
     }
 
     /**

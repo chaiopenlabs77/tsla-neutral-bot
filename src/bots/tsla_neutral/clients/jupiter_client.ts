@@ -20,9 +20,9 @@ import { txSubmittedCounter } from '../observability/metrics';
 
 const log = loggers.lp; // Reuse LP logger for swaps
 
-// Jupiter API endpoints
-const JUPITER_QUOTE_API = 'https://quote-api.jup.ag/v6/quote';
-const JUPITER_SWAP_API = 'https://quote-api.jup.ag/v6/swap';
+// Jupiter API endpoints (public, no auth required)
+const JUPITER_QUOTE_API = 'https://public.jupiterapi.com/quote';
+const JUPITER_SWAP_API = 'https://public.jupiterapi.com/swap';
 
 // Common token mints
 export const TOKEN_MINTS = {

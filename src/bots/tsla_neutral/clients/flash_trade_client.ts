@@ -391,7 +391,9 @@ export class FlashTradeClient {
                     event: 'raw_flash_position_debug',
                     keys: Object.keys(rawData),
                     sizeAmount: rawData.sizeAmount?.toString(),
+                    sizeUsd: rawData.sizeUsd?.toString(), // This is what Flash Trade UI shows
                     collateralAmount: rawData.collateralAmount?.toString(),
+                    collateralUsd: rawData.collateralUsd?.toString(),
                     entryPrice: JSON.stringify(rawData.entryPrice, (k, v) =>
                         typeof v === 'bigint' ? v.toString() : v),
                     side: JSON.stringify(rawData.side),
@@ -402,17 +404,19 @@ export class FlashTradeClient {
                 const data = pos.account;
                 const side = data.side?.long ? 'LONG' : 'SHORT';
 
-                const rawSize = Number(data.sizeAmount || 0);
+                // Use sizeUsd which is what Flash Trade UI displays
+                const rawSizeUsd = Number(data.sizeUsd || data.sizeAmount || 0);
                 const rawEntryPrice = Number(data.entryPrice?.price || 0);
                 const entryPriceExponent = data.entryPrice?.exponent || 0;
 
-                // Size is in USD (6 decimals for USDC-denominated size)
-                const size = rawSize / 1e6;
+                // sizeUsd is in 6 decimals (USDC standard)
+                const size = rawSizeUsd / 1e6;
                 const entryPrice = rawEntryPrice / Math.pow(10, Math.abs(entryPriceExponent));
 
                 log.info({
                     event: 'parsed_flash_position',
-                    rawSize: rawSize.toString(),
+                    rawSizeAmount: data.sizeAmount?.toString(),
+                    rawSizeUsd: rawSizeUsd.toString(),
                     size,
                     rawEntryPrice: rawEntryPrice.toString(),
                     entryPriceExponent,

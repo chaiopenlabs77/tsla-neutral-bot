@@ -384,18 +384,49 @@ export class FlashTradeClient {
                 },
             ]);
 
+            // Debug: log raw position data
+            if (positions.length > 0) {
+                const rawData = positions[0].account;
+                log.info({
+                    event: 'raw_flash_position_debug',
+                    keys: Object.keys(rawData),
+                    sizeAmount: rawData.sizeAmount?.toString(),
+                    collateralAmount: rawData.collateralAmount?.toString(),
+                    entryPrice: JSON.stringify(rawData.entryPrice, (k, v) =>
+                        typeof v === 'bigint' ? v.toString() : v),
+                    side: JSON.stringify(rawData.side),
+                });
+            }
+
             const hedgePositions: HedgePosition[] = positions.map((pos: any) => {
                 const data = pos.account;
                 const side = data.side?.long ? 'LONG' : 'SHORT';
+
+                const rawSize = Number(data.sizeAmount || 0);
+                const rawEntryPrice = Number(data.entryPrice?.price || 0);
+                const entryPriceExponent = data.entryPrice?.exponent || 0;
+
+                // Size is in USD (6 decimals for USDC-denominated size)
+                const size = rawSize / 1e6;
+                const entryPrice = rawEntryPrice / Math.pow(10, Math.abs(entryPriceExponent));
+
+                log.info({
+                    event: 'parsed_flash_position',
+                    rawSize: rawSize.toString(),
+                    size,
+                    rawEntryPrice: rawEntryPrice.toString(),
+                    entryPriceExponent,
+                    entryPrice,
+                    side,
+                    computedDelta: side === 'SHORT' ? -size : size,
+                });
 
                 return {
                     positionId: pos.publicKey.toBase58(),
                     market: this.targetSymbol,
                     side,
-                    size: Number(data.sizeAmount || 0) / 1e9,
-                    entryPrice:
-                        Number(data.entryPrice?.price || 0) /
-                        Math.pow(10, Math.abs(data.entryPrice?.exponent || 0)),
+                    size,
+                    entryPrice,
                     leverage: 1,
                     liquidationPrice: 0, // Calculate from metrics
                     unrealizedPnl: 0,
@@ -446,11 +477,13 @@ export class FlashTradeClient {
     }
 
     /**
-     * Calculate position delta (exposure).
+     * Calculate position delta (exposure in USD).
+     * Size from Flash Trade is already the USD notional value.
      */
     calculatePositionDelta(position: HedgePosition): number {
-        const notionalValue = position.size * position.entryPrice;
-        return position.side === 'SHORT' ? -notionalValue : notionalValue;
+        // Size is already in USD from Flash Trade (sizeAmount / 1e6)
+        // SHORT = negative delta, LONG = positive delta
+        return position.side === 'SHORT' ? -position.size : position.size;
     }
 
     /**

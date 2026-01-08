@@ -25,11 +25,11 @@ import { alerts } from '../observability/alerter';
 
 const log = loggers.hedge;
 
-// Flash Trade mainnet program IDs
-const FLASH_PROGRAM_ID = new PublicKey('PERP9EeXeGnyEqGhfphDnT7NjiEN14LoGHFnGkBdbbL3');
-const COMPOSABILITY_PROGRAM_ID = new PublicKey('CmpM3yUdXvuKAd5pxdPNsqkhJNBaNsWB9h4eGLuUgvA6');
-const FB_NFT_REWARD_PROGRAM_ID = new PublicKey('FBNFTo1GRB8qpSMVpYEy4qSpmPqjyu2jLBskCZzNrKsP');
-const REWARD_DISTRIBUTION_PROGRAM_ID = new PublicKey('RWD4ay7urPzjDqmGPJp5YLqfosXqE6PFLbmcvZWyLpB');
+// Flash Trade mainnet program IDs (from flash-sdk PoolConfig.json)
+const FLASH_PROGRAM_ID = new PublicKey('FLASH6Lo6h3iasJKWDs2F8TkW2UKf3s15C8PMGuVfgBn');
+const COMPOSABILITY_PROGRAM_ID = new PublicKey('FSWAPViR8ny5K96hezav8jynVubP2dJ2L7SbKzds2hwm');
+const FB_NFT_REWARD_PROGRAM_ID = new PublicKey('FBRWDXSLysNbFQk64MQJcpkXP8e4fjezsGabV8jV7d7o');
+const REWARD_DISTRIBUTION_PROGRAM_ID = new PublicKey('FARNT7LL119pmy9vSkN9q1ApZESPaKHuuX5Acz1oBoME');
 
 // Market configuration
 const COLLATERAL_SYMBOL = 'USDC';
@@ -111,10 +111,30 @@ export class FlashTradeClient {
             );
 
             // Load pool configuration
-            this.poolConfig = PoolConfig.fromIdsByName(this.targetSymbol, 'mainnet-beta');
+            // TSLAr is in the 'Remora.1' pool - we need to load by pool name, not market symbol
+            // Then verify our target market exists in that pool
+            const poolName = 'Remora.1'; // Pool containing equity perps like TSLAr
+            this.poolConfig = PoolConfig.fromIdsByName(poolName, 'mainnet-beta');
 
             if (!this.poolConfig) {
-                throw new Error(`Pool config not found for ${this.targetSymbol}`);
+                throw new Error(`Pool config not found for ${poolName}`);
+            }
+
+            // Verify the target market exists in this pool
+            const targetMarket = this.poolConfig.markets?.find(
+                (m: any) => m.targetCustody?.symbol === this.targetSymbol
+            );
+            if (!targetMarket) {
+                // Log available markets for debugging
+                const availableMarkets = this.poolConfig.markets?.map((m: any) => m.targetCustody?.symbol) || [];
+                log.warn({
+                    event: 'target_market_not_found',
+                    target: this.targetSymbol,
+                    availableMarkets,
+                    poolName,
+                });
+            } else {
+                log.info({ event: 'target_market_found', target: this.targetSymbol, poolName });
             }
 
             // Pre-load address lookup tables

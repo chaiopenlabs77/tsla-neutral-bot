@@ -15,6 +15,11 @@ import { alerts } from '../observability/alerter';
 import { isShutdownInProgress, onShutdown } from '../utils/shutdown';
 import { sleep, Backoff } from '../utils/backoff';
 import { getMonotonicTime } from '../utils/clock';
+import { LPClient } from '../clients/lp_client';
+import { FlashTradeClient } from '../clients/flash_trade_client';
+import { PythClient } from '../clients/pyth_client';
+import { Keypair, Connection } from '@solana/web3.js';
+import bs58 from 'bs58';
 
 const log = loggers.orchestrator;
 
@@ -23,6 +28,16 @@ export class Orchestrator {
     private isRunning = false;
     private backoff = new Backoff();
     private cycleCount = 0;
+
+    // Protocol clients
+    private lpClient: LPClient | null = null;
+    private flashTradeClient: FlashTradeClient | null = null;
+    private pythClient: PythClient;
+    private wallet: Keypair | null = null;
+
+    constructor() {
+        this.pythClient = new PythClient();
+    }
 
     /**
      * Initialize the orchestrator.
@@ -35,6 +50,36 @@ export class Orchestrator {
 
         // Start RPC health checks
         getRpcManager().startHealthChecks();
+
+        // Initialize wallet
+        const privateKey = process.env.WALLET_PRIVATE_KEY;
+        if (privateKey) {
+            try {
+                this.wallet = Keypair.fromSecretKey(bs58.decode(privateKey));
+                log.info({ event: 'wallet_loaded', publicKey: this.wallet.publicKey.toBase58() });
+
+                // Initialize protocol clients
+                const connection = getRpcManager().getConnection();
+
+                // Initialize LP Client (Raydium)
+                this.lpClient = new LPClient(connection);
+                await this.lpClient.initialize(this.wallet);
+                log.info({ event: 'lp_client_initialized' });
+
+                // Initialize Flash Trade Client (TSLAr = Tesla equity perp)
+                this.flashTradeClient = new FlashTradeClient(connection, 'TSLAr');
+                await this.flashTradeClient.initialize(this.wallet);
+                log.info({ event: 'flash_trade_client_initialized' });
+            } catch (error) {
+                log.warn({
+                    event: 'client_init_warning',
+                    error: error instanceof Error ? error.message : String(error),
+                    msg: 'Running in monitoring-only mode'
+                });
+            }
+        } else {
+            log.warn({ event: 'no_wallet', msg: 'WALLET_PRIVATE_KEY not set, monitoring-only mode' });
+        }
 
         // Register shutdown handler
         onShutdown(async () => {
@@ -127,22 +172,74 @@ export class Orchestrator {
             return;
         }
 
-        // TODO: Implement actual trading logic
-        // 1. Fetch LP position delta
-        // 2. Fetch hedge position delta
-        // 3. Fetch price data
-        // 4. Evaluate rebalance decision
-        // 5. Execute if needed
+        // ===== LIVE MODE: Fetch real on-chain data =====
 
-        // Placeholder for now
+        // 1. Fetch TSLA price from Pyth
+        let tslaPrice = 0;
+        try {
+            const priceData = await this.pythClient.getTSLAPrice();
+            if (priceData) {
+                tslaPrice = priceData.price;
+                log.debug({ event: 'pyth_price_fetched', price: tslaPrice, confidence: priceData.confidence });
+            }
+        } catch (error) {
+            log.warn({ event: 'pyth_fetch_error', error: error instanceof Error ? error.message : String(error) });
+        }
+
+        // 2. Fetch LP positions and calculate delta
+        let lpDelta = 0;
+        let isLpInRange = true;
+        if (this.lpClient) {
+            try {
+                const lpPositions = await this.lpClient.fetchPositions();
+                for (const pos of lpPositions) {
+                    lpDelta += this.lpClient.calculatePositionDelta(pos, tslaPrice || 400);
+                    isLpInRange = isLpInRange && this.lpClient.isPositionInRange(pos.lowerTick, pos.upperTick);
+                }
+                log.debug({ event: 'lp_positions_fetched', count: lpPositions.length, totalDelta: lpDelta });
+            } catch (error) {
+                log.warn({ event: 'lp_fetch_error', error: error instanceof Error ? error.message : String(error) });
+            }
+        }
+
+        // 3. Fetch hedge positions and calculate delta
+        let hedgeDelta = 0;
+        if (this.flashTradeClient) {
+            try {
+                const hedgePositions = await this.flashTradeClient.fetchPositions();
+                for (const pos of hedgePositions) {
+                    hedgeDelta += this.flashTradeClient.calculatePositionDelta(pos);
+                }
+                log.debug({ event: 'hedge_positions_fetched', count: hedgePositions.length, totalDelta: hedgeDelta });
+            } catch (error) {
+                log.warn({ event: 'hedge_fetch_error', error: error instanceof Error ? error.message : String(error) });
+            }
+        }
+
+        // 4. Evaluate rebalance decision
+        const estimatedGasCost = 0.001; // ~0.001 SOL for tx
         const decision = evaluateRebalance(
             this.state,
-            0, // lpDelta - placeholder
-            0, // hedgeDelta - placeholder
-            0, // estimatedGasCost - placeholder
-            true // isLpInRange - placeholder
+            lpDelta,
+            hedgeDelta,
+            estimatedGasCost,
+            isLpInRange
         );
 
+        // 5. Log metrics (same format as dry-run for consistency)
+        logMetricsSnapshot({
+            cycle: this.cycleCount,
+            dryRun: false,
+            lpDelta,
+            hedgeDelta,
+            netDelta: decision.currentDelta,
+            tslaPrice,
+            isLpInRange,
+            shouldRebalance: decision.shouldRebalance,
+            reason: decision.reason,
+        });
+
+        // 6. Handle rebalance decision
         if (decision.shouldRebalance && !decision.blocked) {
             log.info({
                 event: 'rebalance_triggered',
@@ -153,7 +250,13 @@ export class Orchestrator {
 
             rebalanceCounter.inc({ reason: decision.reason, status: 'pending' });
 
-            // TODO: Execute rebalance
+            // TODO: Execute actual rebalance trades
+            // For now, just log what we would do
+            log.info({
+                event: 'would_execute_rebalance',
+                action: decision.sizeToAdjust > 0 ? 'increase_short' : 'decrease_short',
+                sizeUsd: Math.abs(decision.sizeToAdjust)
+            });
         }
 
         this.state = await recordSuccess(this.state);

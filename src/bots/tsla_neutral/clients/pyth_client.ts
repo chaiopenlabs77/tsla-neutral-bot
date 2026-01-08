@@ -34,7 +34,9 @@ export class PythClient {
 
     constructor() {
         this.hermesClient = new HermesClient(config.PYTH_HERMES_ENDPOINT);
-        this.tslaPriceFeedId = config.PYTH_TSLA_PRICE_FEED_ID;
+        // Strip 0x prefix if present (Hermes API expects raw hex)
+        const feedId = config.PYTH_TSLA_PRICE_FEED_ID;
+        this.tslaPriceFeedId = feedId.startsWith('0x') ? feedId.slice(2) : feedId;
     }
 
     /**

@@ -112,7 +112,10 @@ export class LPClient {
      * Fetch current pool info from chain.
      */
     async fetchPoolInfo(): Promise<ClmmPoolInfo> {
-        this.ensureInitialized();
+        // Note: This can be called during initialization, so we check raydium directly
+        if (!this.raydium) {
+            throw new Error('Raydium SDK not loaded');
+        }
 
         log.info({ event: 'fetching_pool_info', pool: this.poolAddress.toBase58() });
 
@@ -120,14 +123,34 @@ export class LPClient {
             // Fetch pool data from Raydium API
             const poolData = await this.raydium.clmm.getPoolInfoFromRpc(this.poolAddress.toBase58());
 
+            // Log the actual structure for debugging
+            log.info({
+                event: 'pool_data_received',
+                keys: Object.keys(poolData || {}),
+                hasPoolData: !!poolData,
+            });
+
+            if (!poolData) {
+                throw new Error('Pool not found or RPC returned empty response');
+            }
+
+            // Handle different SDK response formats
+            // v2 SDK may use different property names
+            const mintA = poolData.mintA?.address || poolData.mintA?.mint || poolData.mintA;
+            const mintB = poolData.mintB?.address || poolData.mintB?.mint || poolData.mintB;
+            const tickSpacing = poolData.config?.tickSpacing || poolData.tickSpacing || 1;
+            const sqrtPriceX64 = poolData.sqrtPriceX64 || poolData.currentPrice || '0';
+            const tickCurrent = poolData.tickCurrent ?? poolData.currentTickIndex ?? 0;
+            const liquidity = poolData.liquidity || '0';
+
             this.poolInfo = {
                 id: this.poolAddress,
-                mintA: new PublicKey(poolData.mintA.address),
-                mintB: new PublicKey(poolData.mintB.address),
-                tickSpacing: poolData.config.tickSpacing,
-                sqrtPriceX64: BigInt(poolData.sqrtPriceX64.toString()),
-                currentTickIndex: poolData.tickCurrent,
-                liquidity: BigInt(poolData.liquidity.toString()),
+                mintA: typeof mintA === 'string' ? new PublicKey(mintA) : mintA,
+                mintB: typeof mintB === 'string' ? new PublicKey(mintB) : mintB,
+                tickSpacing,
+                sqrtPriceX64: BigInt(sqrtPriceX64.toString()),
+                currentTickIndex: tickCurrent,
+                liquidity: BigInt(liquidity.toString()),
             };
 
             log.info({

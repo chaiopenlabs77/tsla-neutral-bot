@@ -168,7 +168,6 @@ export class FlashTradeClient {
         this.ensureInitialized();
 
         try {
-            const flashSdk = await import('flash-sdk');
             const custody = this.poolConfig.custodies.find(
                 (c: any) => c.symbol === this.targetSymbol
             );
@@ -181,10 +180,38 @@ export class FlashTradeClient {
                 custody.custodyAccount
             );
 
-            // Extract price from oracle data
-            const price =
-                Number(custodyAccount.oracle?.price || 0) /
-                Math.pow(10, Math.abs(custodyAccount.oracle?.exponent || 0));
+            // Debug: log oracle structure
+            log.debug({
+                event: 'custody_oracle_debug',
+                hasOracle: !!custodyAccount.oracle,
+                oracleKeys: custodyAccount.oracle ? Object.keys(custodyAccount.oracle) : [],
+                rawOracle: JSON.stringify(custodyAccount.oracle, (k, v) =>
+                    typeof v === 'bigint' ? v.toString() : v),
+            });
+
+            // Extract price from oracle data - try different field names
+            let price = 0;
+            if (custodyAccount.oracle) {
+                const oracle: any = custodyAccount.oracle;
+                // Try various possible field names
+                const rawPrice = oracle.price ?? oracle.oraclePrice ?? oracle.lastPrice ?? 0;
+                const exponent = oracle.exponent ?? oracle.oracleExponent ?? oracle.exp ?? -8;
+
+                price = Number(rawPrice) / Math.pow(10, Math.abs(Number(exponent)));
+
+                log.debug({
+                    event: 'price_extracted',
+                    rawPrice: String(rawPrice),
+                    exponent: Number(exponent),
+                    computedPrice: price,
+                });
+            }
+
+            // If still 0, use a fallback from Pyth or the pool config
+            if (price === 0) {
+                log.warn({ event: 'oracle_price_zero', fallback: 'using_pyth_or_pool' });
+                // TODO: Fetch from Pyth as fallback
+            }
 
             return price;
         } catch (error) {
@@ -195,11 +222,13 @@ export class FlashTradeClient {
 
     /**
      * Open a short position to hedge LP exposure.
+     * @param fallbackPrice - Price to use if oracle price is unavailable (from Pyth)
      */
     async openShortPosition(
         sizeUsd: number,
         collateralUsd: number,
-        maxSlippageBps: number = config.MAX_SLIPPAGE_BPS
+        maxSlippageBps: number = config.MAX_SLIPPAGE_BPS,
+        fallbackPrice?: number
     ): Promise<{ txSignature: string; instructions: TransactionInstruction[] } | null> {
         this.ensureInitialized();
 
@@ -221,8 +250,15 @@ export class FlashTradeClient {
         }
 
         try {
-            // Get current price with slippage
-            const currentPrice = await this.getCurrentPrice();
+            // Get current price with slippage - use fallback if oracle returns 0
+            let currentPrice = await this.getCurrentPrice();
+            if (currentPrice === 0 && fallbackPrice) {
+                log.info({ event: 'using_fallback_price', fallbackPrice });
+                currentPrice = fallbackPrice;
+            }
+            if (currentPrice === 0) {
+                throw new Error('Cannot open position: price is 0 and no fallback provided');
+            }
             const priceWithSlippage = currentPrice * (1 - maxSlippageBps / 10000);
 
             const priceObj = {

@@ -179,7 +179,7 @@ export function evaluateRebalance(
             reason: 'delta_drift',
             currentDelta: netDelta,
             targetDelta: 0,
-            sizeToAdjust: -netDelta, // Adjust hedge to neutralize
+            sizeToAdjust: netDelta, // Positive netDelta = need short, negative = need to close short
             estimatedSlippage: 0,
             estimatedGasCost,
             blocked: false,

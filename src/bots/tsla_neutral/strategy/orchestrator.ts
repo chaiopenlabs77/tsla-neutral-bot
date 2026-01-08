@@ -351,7 +351,8 @@ export class Orchestrator {
                 const result = await this.flashTradeClient.openShortPosition(
                     cappedSize,
                     collateralUsd,
-                    config.MAX_SLIPPAGE_BPS
+                    config.MAX_SLIPPAGE_BPS,
+                    currentPrice // Pass the TSLA price from Pyth
                 );
 
                 if (result) {

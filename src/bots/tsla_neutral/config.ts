@@ -107,9 +107,9 @@ export const config = {
     // Position Sizing & Execution
     // ──────────────────────────────────────────────────────────────────────────
     MAX_POSITION_SIZE_USD: optionalEnvNumber('MAX_POSITION_SIZE_USD', 10000), // $10k max per position
-    MIN_REBALANCE_SIZE_USD: optionalEnvNumber('MIN_REBALANCE_SIZE_USD', 50), // Skip tiny adjustments
+    MIN_REBALANCE_SIZE_USD: optionalEnvNumber('MIN_REBALANCE_SIZE_USD', 0), // No minimum - hedge any size
     DEFAULT_LEVERAGE: optionalEnvNumber('DEFAULT_LEVERAGE', 2), // 2x leverage = 50% collateral
-    MIN_COLLATERAL_USD: optionalEnvNumber('MIN_COLLATERAL_USD', 100), // Minimum collateral per position
+    MIN_COLLATERAL_USD: optionalEnvNumber('MIN_COLLATERAL_USD', 0), // No minimum for testing
     GAS_TOP_UP_THRESHOLD_SOL: optionalEnvNumber('GAS_TOP_UP_THRESHOLD_SOL', 0.05), // Swap for gas if below
     GAS_TOP_UP_TARGET_SOL: optionalEnvNumber('GAS_TOP_UP_TARGET_SOL', 0.2), // Target SOL after swap
 

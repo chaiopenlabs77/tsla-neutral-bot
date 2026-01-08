@@ -1,5 +1,5 @@
 import { config } from '../config';
-import { BotState, StateMachineState, CycleMetrics } from '../types';
+import { BotState, StateMachineState, CycleMetrics, HedgePosition } from '../types';
 import {
     loadState,
     transitionState,
@@ -221,9 +221,10 @@ export class Orchestrator {
 
         // 3. Fetch hedge positions and calculate delta
         let hedgeDelta = 0;
+        let hedgePositions: HedgePosition[] = [];
         if (this.flashTradeClient) {
             try {
-                const hedgePositions = await this.flashTradeClient.fetchPositions();
+                hedgePositions = await this.flashTradeClient.fetchPositions();
                 for (const pos of hedgePositions) {
                     hedgeDelta += this.flashTradeClient.calculatePositionDelta(pos);
                 }
@@ -268,7 +269,7 @@ export class Orchestrator {
             rebalanceCounter.inc({ reason: decision.reason, status: 'pending' });
 
             // Execute the rebalance
-            const success = await this.executeRebalance(decision.sizeToAdjust, tslaPrice);
+            const success = await this.executeRebalance(decision.sizeToAdjust, tslaPrice, hedgePositions);
 
             if (success) {
                 rebalanceCounter.inc({ reason: decision.reason, status: 'success' });
@@ -284,8 +285,13 @@ export class Orchestrator {
      * Execute a rebalance trade.
      * @param sizeToAdjust - Positive = need more short, negative = need less short
      * @param currentPrice - Current TSLA price for calculations
+     * @param existingPositions - Current hedge positions (to determine if we should increase vs open)
      */
-    private async executeRebalance(sizeToAdjust: number, currentPrice: number): Promise<boolean> {
+    private async executeRebalance(
+        sizeToAdjust: number,
+        currentPrice: number,
+        existingPositions: HedgePosition[] = []
+    ): Promise<boolean> {
         if (!this.flashTradeClient || !this.wallet) {
             log.error({ event: 'rebalance_failed', error: 'Flash Trade client not initialized' });
             return false;
@@ -336,38 +342,71 @@ export class Orchestrator {
         try {
             if (sizeToAdjust > 0) {
                 // Need MORE hedge -> open/increase short position
-                log.info({
-                    event: 'opening_short',
-                    sizeUsd: cappedSize,
-                    leverage: config.DEFAULT_LEVERAGE,
-                });
+                const existingShort = existingPositions.find(p => p.side === 'SHORT');
 
-                // Calculate collateral: size / leverage
-                const collateralUsd = Math.max(
-                    cappedSize / config.DEFAULT_LEVERAGE,
-                    config.MIN_COLLATERAL_USD
-                );
-
-                const result = await this.flashTradeClient.openShortPosition(
-                    cappedSize,
-                    collateralUsd,
-                    config.MAX_SLIPPAGE_BPS,
-                    currentPrice // Pass the TSLA price from Pyth
-                );
-
-                if (result) {
+                if (existingShort) {
+                    // Existing position - use increaseSize
                     log.info({
-                        event: 'short_opened',
-                        txSignature: result.txSignature,
-                        sizeUsd: cappedSize,
-                        collateralUsd,
+                        event: 'increasing_short',
+                        existingPositionId: existingShort.positionId,
+                        additionalSizeUsd: cappedSize,
                     });
-                    alertInfo('REBALANCE_EXECUTED', `Opened short: $${cappedSize} (tx: ${result.txSignature.slice(0, 8)}...)`);
-                    return true;
+
+                    const result = await this.flashTradeClient.increaseShortPosition(
+                        existingShort.positionId,
+                        cappedSize,
+                        config.MAX_SLIPPAGE_BPS,
+                        currentPrice
+                    );
+
+                    if (result) {
+                        log.info({
+                            event: 'short_increased',
+                            txSignature: result.txSignature,
+                            additionalSizeUsd: cappedSize,
+                        });
+                        alertInfo('REBALANCE_EXECUTED', `Increased short by $${cappedSize.toFixed(2)} (tx: ${result.txSignature.slice(0, 8)}...)`);
+                        return true;
+                    } else {
+                        log.error({ event: 'short_increase_failed', sizeUsd: cappedSize });
+                        alertWarning('REBALANCE_FAILED', `Failed to increase short: $${cappedSize}`);
+                        return false;
+                    }
                 } else {
-                    log.error({ event: 'short_open_failed', sizeUsd: cappedSize });
-                    alertWarning('REBALANCE_FAILED', `Failed to open short: $${cappedSize}`);
-                    return false;
+                    // No existing position - open new one
+                    log.info({
+                        event: 'opening_short',
+                        sizeUsd: cappedSize,
+                        leverage: config.DEFAULT_LEVERAGE,
+                    });
+
+                    // Calculate collateral: size / leverage
+                    const collateralUsd = Math.max(
+                        cappedSize / config.DEFAULT_LEVERAGE,
+                        config.MIN_COLLATERAL_USD
+                    );
+
+                    const result = await this.flashTradeClient.openShortPosition(
+                        cappedSize,
+                        collateralUsd,
+                        config.MAX_SLIPPAGE_BPS,
+                        currentPrice // Pass the TSLA price from Pyth
+                    );
+
+                    if (result) {
+                        log.info({
+                            event: 'short_opened',
+                            txSignature: result.txSignature,
+                            sizeUsd: cappedSize,
+                            collateralUsd,
+                        });
+                        alertInfo('REBALANCE_EXECUTED', `Opened short: $${cappedSize} (tx: ${result.txSignature.slice(0, 8)}...)`);
+                        return true;
+                    } else {
+                        log.error({ event: 'short_open_failed', sizeUsd: cappedSize });
+                        alertWarning('REBALANCE_FAILED', `Failed to open short: $${cappedSize}`);
+                        return false;
+                    }
                 }
             } else {
                 // Need LESS hedge -> close/reduce short position

@@ -365,6 +365,93 @@ export class FlashTradeClient {
     }
 
     /**
+     * Increase an existing short position size.
+     * Use this when a position already exists instead of openPosition.
+     */
+    async increaseShortPosition(
+        positionPubKey: string,
+        additionalSizeUsd: number,
+        maxSlippageBps: number = config.MAX_SLIPPAGE_BPS,
+        fallbackPrice?: number
+    ): Promise<{ txSignature: string } | null> {
+        this.ensureInitialized();
+
+        log.info({
+            event: 'increasing_short_position',
+            target: this.targetSymbol,
+            positionPubKey,
+            additionalSizeUsd,
+            maxSlippageBps,
+        });
+
+        if (config.DRY_RUN) {
+            log.info({
+                event: 'dry_run_increase_short',
+                msg: `Would increase SHORT by $${additionalSizeUsd} ${this.targetSymbol}`,
+            });
+            txSubmittedCounter.inc({ type: 'increase_short', status: 'dry_run' });
+            return { txSignature: 'dry-run-signature' };
+        }
+
+        try {
+            // Get current price with slippage - use fallback if oracle returns 0
+            let currentPrice = await this.getCurrentPrice();
+            if (currentPrice === 0 && fallbackPrice) {
+                log.info({ event: 'using_fallback_price', fallbackPrice });
+                currentPrice = fallbackPrice;
+            }
+            if (currentPrice === 0) {
+                throw new Error('Cannot increase position: price is 0 and no fallback provided');
+            }
+            const priceWithSlippage = currentPrice * (1 - maxSlippageBps / 10000);
+
+            const priceObj = {
+                price: new BN(Math.floor(priceWithSlippage * 1e5)),
+                exponent: -5,
+            };
+
+            // Size delta in 6 decimals
+            const sizeDeltaBN = new BN(Math.floor(additionalSizeUsd * 1e6));
+
+            log.info({
+                event: 'increase_position_params',
+                targetSymbol: this.targetSymbol,
+                collateralSymbol: COLLATERAL_SYMBOL,
+                positionPubKey,
+                price: priceObj.price.toString(),
+                sizeDelta: sizeDeltaBN.toString(),
+                side: 'short',
+            });
+
+            // Use Flash Trade SDK's increaseSize
+            const { instructions, additionalSigners } = await this.perpClient.increaseSize(
+                this.targetSymbol,
+                COLLATERAL_SYMBOL,
+                new PublicKey(positionPubKey),
+                { short: {} }, // Side
+                this.poolConfig,
+                priceObj,
+                sizeDeltaBN,
+                { none: {} } // Privilege
+            );
+
+            const txSignature = await this.buildAndSendTransaction(instructions, additionalSigners);
+
+            log.info({ event: 'short_position_increased', txSignature });
+            txSubmittedCounter.inc({ type: 'increase_short', status: 'success' });
+
+            return { txSignature };
+        } catch (error) {
+            log.error({
+                event: 'increase_short_error',
+                error: error instanceof Error ? error.message : String(error),
+            });
+            txSubmittedCounter.inc({ type: 'increase_short', status: 'failure' });
+            return null;
+        }
+    }
+
+    /**
      * Fetch user's open positions.
      */
     async fetchPositions(): Promise<HedgePosition[]> {

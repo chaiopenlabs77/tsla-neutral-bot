@@ -411,14 +411,15 @@ export class LPClient {
                 poolInfo: poolData.poolInfo,
                 poolKeys: poolData.poolKeys,
                 ownerInfo: {
-                    useSOLBalance: true,
+                    useSOLBalance: false, // Not using WSOL
                 },
                 tickLower: lowerTick,
                 tickUpper: upperTick,
                 base: 'MintA',
                 baseAmount: new BN(amountA.toString()),
                 otherAmountMax: new BN(amountB.toString()),
-                txVersion: 'V0', // Use versioned transactions
+                txVersion: 'V0',
+                nft2022: true, // Use Token2022 for position NFT
             });
 
             // Execute the transaction

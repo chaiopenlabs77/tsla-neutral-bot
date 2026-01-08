@@ -286,7 +286,7 @@ export class Orchestrator {
      * @param currentPrice - Current TSLA price for calculations
      */
     private async executeRebalance(sizeToAdjust: number, currentPrice: number): Promise<boolean> {
-        if (!this.flashTradeClient) {
+        if (!this.flashTradeClient || !this.wallet) {
             log.error({ event: 'rebalance_failed', error: 'Flash Trade client not initialized' });
             return false;
         }
@@ -306,6 +306,32 @@ export class Orchestrator {
 
         // Cap position size
         const cappedSize = Math.min(absSize, config.MAX_POSITION_SIZE_USD);
+
+        // For opening new shorts, check if we have enough USDC for collateral
+        if (sizeToAdjust > 0) {
+            const requiredCollateral = cappedSize / config.DEFAULT_LEVERAGE;
+            const connection = getRpcManager().getConnection();
+            try {
+                const { getAssociatedTokenAddress } = await import('@solana/spl-token');
+                const usdcAta = await getAssociatedTokenAddress(config.USDC_MINT, this.wallet.publicKey);
+                const accountInfo = await connection.getTokenAccountBalance(usdcAta);
+                const availableUsdc = Number(accountInfo.value.amount) / 1_000_000;
+
+                if (availableUsdc < requiredCollateral) {
+                    log.warn({
+                        event: 'rebalance_skipped',
+                        reason: 'insufficient_collateral',
+                        required: requiredCollateral.toFixed(2),
+                        available: availableUsdc.toFixed(2),
+                    });
+                    alertWarning('REBALANCE_BLOCKED', `Insufficient USDC: need $${requiredCollateral.toFixed(2)}, have $${availableUsdc.toFixed(2)}`);
+                    return false;
+                }
+            } catch (error) {
+                log.warn({ event: 'rebalance_balance_check_failed', error: String(error) });
+                // Continue anyway - Flash Trade will fail if insufficient
+            }
+        }
 
         try {
             if (sizeToAdjust > 0) {
@@ -384,14 +410,42 @@ export class Orchestrator {
      * 3. Open matching hedge on Flash Trade
      */
     private async bootstrapPosition(currentPrice: number): Promise<boolean> {
-        if (!this.lpClient || !this.jupiterClient || !this.flashTradeClient) {
+        if (!this.lpClient || !this.jupiterClient || !this.flashTradeClient || !this.wallet) {
             log.error({ event: 'bootstrap_failed', error: 'Clients not initialized' });
             return false;
         }
 
-        const totalCapitalUsd = config.BOOTSTRAP_AMOUNT_USD;
         const rangePercent = config.BOOTSTRAP_LP_RANGE_PERCENT;
         const leverage = config.DEFAULT_LEVERAGE;
+
+        // Fetch actual USDC balance from wallet
+        const connection = getRpcManager().getConnection();
+        const usdcMint = config.USDC_MINT;
+
+        let usdcBalanceMicro: bigint;
+        try {
+            const { getAssociatedTokenAddress } = await import('@solana/spl-token');
+            const usdcAta = await getAssociatedTokenAddress(usdcMint, this.wallet.publicKey);
+            const accountInfo = await connection.getTokenAccountBalance(usdcAta);
+            usdcBalanceMicro = BigInt(accountInfo.value.amount);
+        } catch (error) {
+            log.error({ event: 'bootstrap_failed', error: 'Could not fetch USDC balance' });
+            return false;
+        }
+
+        const totalCapitalUsd = Number(usdcBalanceMicro) / 1_000_000; // Convert from micro to USD
+
+        // Minimum viable amount check
+        const minRequired = 5; // At least $5 needed for meaningful position
+        if (totalCapitalUsd < minRequired) {
+            log.warn({
+                event: 'bootstrap_skipped',
+                reason: 'insufficient_usdc',
+                available: totalCapitalUsd.toFixed(2),
+                required: minRequired,
+            });
+            return false;
+        }
 
         // Calculate capital allocation:
         // - LP needs: $L/2 for TSLAx swap + $L/2 for USDC side = $L total
@@ -405,7 +459,7 @@ export class Orchestrator {
 
         log.info({
             event: 'bootstrap_starting',
-            totalCapitalUsd,
+            walletUsdcBalance: totalCapitalUsd.toFixed(2),
             lpValueUsd: lpValueUsd.toFixed(2),
             hedgeCollateralUsd: hedgeCollateralUsd.toFixed(2),
             swapAmountUsd: swapAmountUsd.toFixed(2),

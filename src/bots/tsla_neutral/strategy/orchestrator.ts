@@ -562,20 +562,21 @@ export class Orchestrator {
             const actualTslaxValueUsd = (Number(tslaxAmount) / 1e8) * currentPrice;
 
             // Step 2: Open LP position
-            // TSLAx has 8 decimals, USDC has 6 decimals
-            // USDC side should match TSLAx value for balanced LP
-            const usdcAmountMicro = BigInt(Math.floor(actualTslaxValueUsd * 1_000_000));
+            // Pass all available USDC as max - SDK will calculate exact amount needed
+            // based on TSLAx amount and tick range
+            const availableUsdcMicro = usdcBalanceMicro - BigInt(Math.floor(hedgeCollateralUsd * 1_000_000));
 
             log.info({
                 event: 'bootstrap_opening_lp',
                 tslaxAmount: tslaxAmount.toString(),
-                usdcAmount: usdcAmountMicro.toString(),
+                availableUsdcForLp: availableUsdcMicro.toString(),
+                actualTslaxValueUsd: actualTslaxValueUsd.toFixed(2),
                 rangePercent,
             });
 
             const lpResult = await this.lpClient.openPosition(
                 tslaxAmount,
-                usdcAmountMicro,
+                availableUsdcMicro, // Pass max available, SDK calculates exact
                 rangePercent
             );
 

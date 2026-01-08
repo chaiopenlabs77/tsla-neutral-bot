@@ -226,13 +226,25 @@ export class FlashTradeClient {
             const priceWithSlippage = currentPrice * (1 - maxSlippageBps / 10000);
 
             const priceObj = {
-                price: new BN(Math.floor(priceWithSlippage * 1e6)),
-                exponent: -6,
+                price: new BN(Math.floor(priceWithSlippage * 1e5)), // 1e5 for exponent -5
+                exponent: -5, // Flash Trade uses -5 exponent
             };
 
             // Convert amounts to BN with proper decimals
             const sizeBN = new BN(Math.floor(sizeUsd * 1e6));
             const collateralBN = new BN(Math.floor(collateralUsd * 1e6));
+
+            log.info({
+                event: 'open_position_params',
+                targetSymbol: this.targetSymbol,
+                collateralSymbol: COLLATERAL_SYMBOL,
+                price: priceObj.price.toString(),
+                exponent: priceObj.exponent,
+                collateral: collateralBN.toString(),
+                size: sizeBN.toString(),
+                side: 'short',
+                poolAddress: this.poolConfig?.poolAddress?.toBase58(),
+            });
 
             // Build open position instruction
             const { instructions, additionalSigners } = await this.perpClient.openPosition(

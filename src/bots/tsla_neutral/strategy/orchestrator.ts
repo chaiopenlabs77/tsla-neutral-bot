@@ -469,28 +469,51 @@ export class Orchestrator {
         });
 
         try {
-            // Step 1: Check if we already have TSLAx (from previous failed attempt)
-            let tslaxAmount: bigint;
-            const { getAssociatedTokenAddress } = await import('@solana/spl-token');
+            // Step 1: Check existing TSLAx balance
+            const { getAssociatedTokenAddress, TOKEN_2022_PROGRAM_ID } = await import('@solana/spl-token');
 
+            let existingTslax: bigint = 0n;
             try {
-                const tslaxAta = await getAssociatedTokenAddress(config.TSLAX_MINT, this.wallet.publicKey);
+                // TSLAx is Token2022
+                const tslaxAta = await getAssociatedTokenAddress(
+                    config.TSLAX_MINT,
+                    this.wallet.publicKey,
+                    false,
+                    TOKEN_2022_PROGRAM_ID
+                );
                 const tslaxInfo = await connection.getTokenAccountBalance(tslaxAta);
-                tslaxAmount = BigInt(tslaxInfo.value.amount);
+                existingTslax = BigInt(tslaxInfo.value.amount);
             } catch {
-                tslaxAmount = 0n; // No TSLAx account exists
+                existingTslax = 0n; // No TSLAx account exists
             }
 
-            if (tslaxAmount > 0n) {
+            // TSLAx has 8 decimals - calculate existing value in USD
+            const existingTslaxUsd = (Number(existingTslax) / 1e8) * currentPrice;
+
+            // Calculate target TSLAx amount for LP (half of LP value)
+            const targetTslaxUsd = swapAmountUsd; // This is lpValueUsd / 2
+
+            // Calculate delta - how much more TSLAx we need
+            const deltaUsd = targetTslaxUsd - existingTslaxUsd;
+
+            log.info({
+                event: 'bootstrap_capital_check',
+                existingTslaxRaw: existingTslax.toString(),
+                existingTslaxUsd: existingTslaxUsd.toFixed(2),
+                targetTslaxUsd: targetTslaxUsd.toFixed(2),
+                deltaUsd: deltaUsd.toFixed(2),
+            });
+
+            let tslaxAmount: bigint;
+
+            if (deltaUsd > 0.50) {
+                // Need more TSLAx - swap only the delta needed
+                const swapAmountMicro = BigInt(Math.floor(deltaUsd * 1_000_000));
                 log.info({
-                    event: 'bootstrap_using_existing_tslax',
-                    amount: tslaxAmount.toString(),
-                    msg: 'Using existing TSLAx from previous attempt'
+                    event: 'bootstrap_swapping_delta',
+                    amountUsd: deltaUsd.toFixed(2),
+                    msg: 'Swapping only the additional amount needed'
                 });
-            } else {
-                // No TSLAx, need to swap
-                const swapAmountMicro = BigInt(Math.floor(swapAmountUsd * 1_000_000));
-                log.info({ event: 'bootstrap_swapping', amountUsd: swapAmountUsd.toFixed(2) });
 
                 const swapResult = await this.jupiterClient.swapUsdcToTslax(swapAmountMicro);
                 if (!swapResult) {
@@ -505,12 +528,33 @@ export class Orchestrator {
                     tslaxReceived: swapResult.tslaxAmount,
                 });
 
-                tslaxAmount = BigInt(swapResult.tslaxAmount);
+                // Total TSLAx = existing + newly swapped
+                tslaxAmount = existingTslax + BigInt(swapResult.tslaxAmount);
+            } else if (deltaUsd < -0.50) {
+                // Have excess TSLAx - could swap some back, but for now just use what we have
+                log.info({
+                    event: 'bootstrap_excess_tslax',
+                    excessUsd: (-deltaUsd).toFixed(2),
+                    msg: 'Using existing TSLAx without additional swap'
+                });
+                tslaxAmount = existingTslax;
+            } else {
+                // Close enough - use existing without swap
+                log.info({
+                    event: 'bootstrap_using_existing',
+                    msg: 'Existing TSLAx matches target, no swap needed'
+                });
+                tslaxAmount = existingTslax;
             }
 
+            // Recalculate USDC needed for LP based on actual TSLAx we have
+            // LP should be balanced, so USDC side should match TSLAx value
+            const actualTslaxValueUsd = (Number(tslaxAmount) / 1e8) * currentPrice;
+
             // Step 2: Open LP position
-            // TSLAx has 8 decimals (not 9!), USDC has 6 decimals
-            const usdcAmountMicro = BigInt(Math.floor(lpUsdcSideUsd * 1_000_000));
+            // TSLAx has 8 decimals, USDC has 6 decimals
+            // USDC side should match TSLAx value for balanced LP
+            const usdcAmountMicro = BigInt(Math.floor(actualTslaxValueUsd * 1_000_000));
 
             log.info({
                 event: 'bootstrap_opening_lp',
@@ -537,8 +581,7 @@ export class Orchestrator {
             });
 
             // Step 3: Open matching hedge
-            // Hedge size should match ACTUAL TSLAx value (TSLAx has 8 decimals)
-            const actualTslaxValueUsd = (Number(tslaxAmount) / 1e8) * currentPrice;
+            // Hedge size should match ACTUAL TSLAx value
             const hedgeSize = actualTslaxValueUsd;
             const collateral = Math.min(hedgeCollateralUsd, hedgeSize / config.DEFAULT_LEVERAGE);
 

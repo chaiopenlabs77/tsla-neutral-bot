@@ -114,6 +114,13 @@ export const config = {
     GAS_TOP_UP_TARGET_SOL: optionalEnvNumber('GAS_TOP_UP_TARGET_SOL', 0.2), // Target SOL after swap
 
     // ──────────────────────────────────────────────────────────────────────────
+    // Bootstrap (Initial Position Creation)
+    // ──────────────────────────────────────────────────────────────────────────
+    AUTO_BOOTSTRAP: optionalEnvBool('AUTO_BOOTSTRAP', false), // If true, create initial LP when none exists
+    BOOTSTRAP_AMOUNT_USD: optionalEnvNumber('BOOTSTRAP_AMOUNT_USD', 1000), // Initial investment size
+    BOOTSTRAP_LP_RANGE_PERCENT: optionalEnvNumber('BOOTSTRAP_LP_RANGE_PERCENT', 0.05), // ±5% price range
+
+    // ──────────────────────────────────────────────────────────────────────────
     // Timing
     // ──────────────────────────────────────────────────────────────────────────
     LOOP_INTERVAL_MS: optionalEnvNumber('LOOP_INTERVAL_MS', 10000), // 10 seconds

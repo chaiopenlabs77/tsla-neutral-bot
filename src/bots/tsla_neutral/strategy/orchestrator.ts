@@ -18,6 +18,7 @@ import { getMonotonicTime } from '../utils/clock';
 import { LPClient } from '../clients/lp_client';
 import { FlashTradeClient } from '../clients/flash_trade_client';
 import { PythClient } from '../clients/pyth_client';
+import { JupiterClient, TOKEN_MINTS } from '../clients/jupiter_client';
 import { Keypair, Connection } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -32,8 +33,10 @@ export class Orchestrator {
     // Protocol clients
     private lpClient: LPClient | null = null;
     private flashTradeClient: FlashTradeClient | null = null;
+    private jupiterClient: JupiterClient | null = null;
     private pythClient: PythClient;
     private wallet: Keypair | null = null;
+    private hasBootstrapped = false;
 
     constructor() {
         this.pythClient = new PythClient();
@@ -70,6 +73,11 @@ export class Orchestrator {
                 this.flashTradeClient = new FlashTradeClient(connection, 'TSLAr');
                 await this.flashTradeClient.initialize(this.wallet);
                 log.info({ event: 'flash_trade_client_initialized' });
+
+                // Initialize Jupiter Client (for swaps)
+                this.jupiterClient = new JupiterClient(connection);
+                await this.jupiterClient.initialize(this.wallet);
+                log.info({ event: 'jupiter_client_initialized' });
             } catch (error) {
                 log.warn({
                     event: 'client_init_warning',
@@ -189,14 +197,23 @@ export class Orchestrator {
         // 2. Fetch LP positions and calculate delta
         let lpDelta = 0;
         let isLpInRange = true;
+        let lpPositionCount = 0;
         if (this.lpClient) {
             try {
                 const lpPositions = await this.lpClient.fetchPositions();
+                lpPositionCount = lpPositions.length;
                 for (const pos of lpPositions) {
                     lpDelta += this.lpClient.calculatePositionDelta(pos, tslaPrice || 400);
                     isLpInRange = isLpInRange && this.lpClient.isPositionInRange(pos.lowerTick, pos.upperTick);
                 }
                 log.debug({ event: 'lp_positions_fetched', count: lpPositions.length, totalDelta: lpDelta });
+
+                // Bootstrap: Create initial LP position if none exists
+                if (lpPositionCount === 0 && config.AUTO_BOOTSTRAP && !this.hasBootstrapped) {
+                    log.info({ event: 'bootstrap_check', noPositions: true, autoBootstrap: true });
+                    await this.bootstrapPosition(tslaPrice);
+                    return; // Wait for next cycle to process the new position
+                }
             } catch (error) {
                 log.warn({ event: 'lp_fetch_error', error: error instanceof Error ? error.message : String(error) });
             }
@@ -356,6 +373,131 @@ export class Orchestrator {
                 sizeToAdjust,
             });
             alerts.txFailure('rebalance', error instanceof Error ? error.message : String(error));
+            return false;
+        }
+    }
+
+    /**
+     * Bootstrap initial position from scratch.
+     * 1. Swap half of USDC to TSLAx
+     * 2. Open concentrated LP position
+     * 3. Open matching hedge on Flash Trade
+     */
+    private async bootstrapPosition(currentPrice: number): Promise<boolean> {
+        if (!this.lpClient || !this.jupiterClient || !this.flashTradeClient) {
+            log.error({ event: 'bootstrap_failed', error: 'Clients not initialized' });
+            return false;
+        }
+
+        const investmentUsd = config.BOOTSTRAP_AMOUNT_USD;
+        const rangePercent = config.BOOTSTRAP_LP_RANGE_PERCENT;
+
+        log.info({
+            event: 'bootstrap_starting',
+            investmentUsd,
+            currentPrice,
+            rangePercent,
+        });
+
+        try {
+            // Step 1: Swap half of USDC to TSLAx for LP
+            // LP needs 50/50 value split
+            const swapAmountUsd = investmentUsd / 2;
+            const swapAmountMicro = BigInt(Math.floor(swapAmountUsd * 1_000_000)); // USDC has 6 decimals
+
+            log.info({ event: 'bootstrap_swapping', amountUsd: swapAmountUsd });
+
+            const swapResult = await this.jupiterClient.swapUsdcToTslax(swapAmountMicro);
+            if (!swapResult) {
+                log.error({ event: 'bootstrap_swap_failed' });
+                alertWarning('BOOTSTRAP_FAILED', 'Failed to swap USDC to TSLAx');
+                return false;
+            }
+
+            log.info({
+                event: 'bootstrap_swap_complete',
+                txSignature: swapResult.txSignature,
+                tslaxReceived: swapResult.tslaxAmount,
+            });
+
+            // Step 2: Open LP position
+            // TSLAx has 9 decimals, USDC has 6 decimals
+            // We received tslaxAmount from the swap, and we'll use remaining USDC
+            const tslaxAmount = BigInt(swapResult.tslaxAmount);
+            const usdcAmount = swapAmountMicro; // Same amount of USDC for the other side
+
+            log.info({
+                event: 'bootstrap_opening_lp',
+                tslaxAmount: tslaxAmount.toString(),
+                usdcAmount: usdcAmount.toString(),
+                rangePercent,
+            });
+
+            const lpResult = await this.lpClient.openPosition(
+                tslaxAmount,
+                usdcAmount,
+                rangePercent
+            );
+
+            if (!lpResult) {
+                log.error({ event: 'bootstrap_lp_failed' });
+                alertWarning('BOOTSTRAP_FAILED', 'Failed to open LP position');
+                return false;
+            }
+
+            log.info({
+                event: 'bootstrap_lp_opened',
+                txSignature: lpResult.txSignature,
+            });
+
+            // Step 3: Open matching hedge
+            // LP creates long exposure equal to the TSLAx value
+            const hedgeSize = swapAmountUsd;
+            const collateral = hedgeSize / config.DEFAULT_LEVERAGE;
+
+            log.info({
+                event: 'bootstrap_opening_hedge',
+                hedgeSizeUsd: hedgeSize,
+                collateralUsd: collateral,
+            });
+
+            const hedgeResult = await this.flashTradeClient.openShortPosition(
+                hedgeSize,
+                collateral,
+                config.MAX_SLIPPAGE_BPS
+            );
+
+            if (!hedgeResult) {
+                log.error({ event: 'bootstrap_hedge_failed' });
+                alertWarning('BOOTSTRAP_FAILED', 'Failed to open hedge position');
+                // Note: LP is already open, but we failed to hedge. 
+                // This is a partial success - the next cycle will detect the imbalance
+                return false;
+            }
+
+            log.info({
+                event: 'bootstrap_hedge_opened',
+                txSignature: hedgeResult.txSignature,
+            });
+
+            // Mark bootstrap as complete
+            this.hasBootstrapped = true;
+
+            alertInfo('BOOTSTRAP_COMPLETE', `Initial position created: $${investmentUsd} deployed`);
+            log.info({
+                event: 'bootstrap_complete',
+                totalInvestment: investmentUsd,
+                lpValue: swapAmountUsd,
+                hedgeSize,
+            });
+
+            return true;
+        } catch (error) {
+            log.error({
+                event: 'bootstrap_error',
+                error: error instanceof Error ? error.message : String(error),
+            });
+            alerts.txFailure('bootstrap', error instanceof Error ? error.message : String(error));
             return false;
         }
     }

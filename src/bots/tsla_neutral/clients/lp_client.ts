@@ -198,15 +198,20 @@ export class LPClient {
 
     /**
      * Get current pool price from sqrtPriceX64.
+     * Returns price in USDC per TSLAx.
      */
     getCurrentPrice(): number {
         if (!this.poolInfo) {
             throw new Error('Pool info not loaded. Call fetchPoolInfo first.');
         }
 
-        // sqrtPriceX64 to price: price = (sqrtPriceX64 / 2^64)^2
+        // sqrtPriceX64 to raw price: rawPrice = (sqrtPriceX64 / 2^64)^2
         const sqrtPrice = Number(this.poolInfo.sqrtPriceX64) / Math.pow(2, 64);
-        return sqrtPrice * sqrtPrice;
+        const rawPrice = sqrtPrice * sqrtPrice;
+
+        // Adjust for decimal difference: TSLAx has 8 decimals, USDC has 6
+        // Multiply by 10^(8-6) = 100 to get actual price in USDC per TSLAx
+        return rawPrice * 100;
     }
 
     /**
@@ -347,17 +352,74 @@ export class LPClient {
                 programId: this.raydium.clmm.programId,
             });
 
-            const lpPositions: LPPosition[] = positions.map((pos: any) => ({
-                mint: new PublicKey(pos.nftMint),
-                poolAddress: this.poolAddress,
-                lowerTick: pos.tickLower,
-                upperTick: pos.tickUpper,
-                liquidity: BigInt(pos.liquidity.toString()),
-                tokenAAmount: BigInt(pos.amountA?.toString() || '0'),
-                tokenBAmount: BigInt(pos.amountB?.toString() || '0'),
-                inRange: this.isPositionInRange(pos.tickLower, pos.tickUpper),
-                entryPrice: this.getCurrentPrice(),
-            }));
+            // Debug: log raw position data
+            if (positions.length > 0) {
+                log.info({
+                    event: 'raw_position_debug',
+                    keys: Object.keys(positions[0] || {}),
+                    tickLower: positions[0].tickLower,
+                    tickUpper: positions[0].tickUpper,
+                    liquidity: positions[0].liquidity?.toString(),
+                });
+            }
+
+            // Get pool info for current sqrt price
+            const poolData = await this.raydium.clmm.getPoolInfoFromRpc(this.poolAddress.toBase58());
+            const sqrtPriceCurrentX64 = poolData.computePoolInfo.sqrtPriceX64;
+
+            // Use SDK to calculate amounts from liquidity
+            const { SqrtPriceMath, LiquidityMath } = await import('@raydium-io/raydium-sdk-v2');
+            const BN = (await import('bn.js')).default;
+
+            const lpPositions: LPPosition[] = positions.map((pos: any) => {
+                // Get sqrt prices for tick bounds using SqrtPriceMath
+                const sqrtPriceLowerX64 = SqrtPriceMath.getSqrtPriceX64FromTick(pos.tickLower);
+                const sqrtPriceUpperX64 = SqrtPriceMath.getSqrtPriceX64FromTick(pos.tickUpper);
+
+                // Use LiquidityMath method to get amounts from liquidity
+                const liquidity = new BN(pos.liquidity.toString());
+                const amounts = LiquidityMath.getAmountsFromLiquidity(
+                    sqrtPriceCurrentX64,
+                    sqrtPriceLowerX64,
+                    sqrtPriceUpperX64,
+                    liquidity,
+                    false // roundUp
+                );
+
+                const tokenAAmount = BigInt(amounts.amountA.toString());
+                const tokenBAmount = BigInt(amounts.amountB.toString());
+
+                log.debug({
+                    event: 'calculated_position_amounts',
+                    tickLower: pos.tickLower,
+                    tickUpper: pos.tickUpper,
+                    liquidity: liquidity.toString(),
+                    tokenAAmount: tokenAAmount.toString(),
+                    tokenBAmount: tokenBAmount.toString(),
+                });
+
+                return {
+                    mint: new PublicKey(pos.nftMint),
+                    poolAddress: this.poolAddress,
+                    lowerTick: pos.tickLower,
+                    upperTick: pos.tickUpper,
+                    liquidity: BigInt(pos.liquidity.toString()),
+                    tokenAAmount,
+                    tokenBAmount,
+                    inRange: this.isPositionInRange(pos.tickLower, pos.tickUpper),
+                    entryPrice: this.getCurrentPrice(),
+                };
+            });
+
+            // Debug: log parsed amounts
+            if (lpPositions.length > 0) {
+                log.info({
+                    event: 'parsed_position_amounts',
+                    tokenAAmount: lpPositions[0].tokenAAmount.toString(),
+                    tokenBAmount: lpPositions[0].tokenBAmount.toString(),
+                    liquidity: lpPositions[0].liquidity.toString(),
+                });
+            }
 
             log.info({ event: 'lp_positions_fetched', count: lpPositions.length });
             return lpPositions;
@@ -508,25 +570,32 @@ export class LPClient {
     }
 
     /**
-     * Calculate LP position delta (exposure to token A).
+     * Calculate LP position delta (exposure to token A in USD terms).
+     * Delta = TSLAx exposure value in USD (positive = long TSLAx)
      */
-    calculatePositionDelta(position: LPPosition, currentPrice: number): number {
-        const lowerPrice = Math.pow(1.0001, position.lowerTick);
-        const upperPrice = Math.pow(1.0001, position.upperTick);
+    calculatePositionDelta(position: LPPosition, _currentTslaPrice: number): number {
+        // Convert raw amounts to actual token amounts
+        // TSLAx (token A) has 8 decimals, USDC (token B) has 6 decimals
+        const tokenAAmount = Number(position.tokenAAmount) / 1e8; // TSLAx
+        const tokenBAmount = Number(position.tokenBAmount) / 1e6; // USDC
 
-        let tokenAPercent: number;
+        // Get pool price (USDC per TSLAx) from tick
+        const poolPrice = this.getCurrentPrice(); // Returns pool price in USDC/TSLAx
 
-        if (currentPrice <= lowerPrice) {
-            tokenAPercent = 1.0;
-        } else if (currentPrice >= upperPrice) {
-            tokenAPercent = 0.0;
-        } else {
-            tokenAPercent = (upperPrice - currentPrice) / (upperPrice - lowerPrice);
-        }
+        // Calculate USD value of TSLAx held
+        // Delta = TSLAx amount * pool price (gives USD value)
+        const tslaxValueUsd = tokenAAmount * poolPrice;
 
-        const totalValue =
-            Number(position.tokenAAmount) * currentPrice + Number(position.tokenBAmount);
-        return totalValue * tokenAPercent;
+        log.debug({
+            event: 'delta_calculation',
+            tokenAAmount: tokenAAmount.toFixed(8),
+            tokenBAmount: tokenBAmount.toFixed(6),
+            poolPrice: poolPrice.toFixed(4),
+            tslaxValueUsd: tslaxValueUsd.toFixed(4),
+        });
+
+        // Return delta in USD terms (the dollar value of TSLAx exposure)
+        return tslaxValueUsd;
     }
 
     /**

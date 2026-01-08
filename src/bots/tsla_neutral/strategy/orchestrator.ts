@@ -389,23 +389,36 @@ export class Orchestrator {
             return false;
         }
 
-        const investmentUsd = config.BOOTSTRAP_AMOUNT_USD;
+        const totalCapitalUsd = config.BOOTSTRAP_AMOUNT_USD;
         const rangePercent = config.BOOTSTRAP_LP_RANGE_PERCENT;
+        const leverage = config.DEFAULT_LEVERAGE;
+
+        // Calculate capital allocation:
+        // - LP needs: $L/2 for TSLAx swap + $L/2 for USDC side = $L total
+        // - Hedge needs: $L/leverage for collateral (e.g., 2x leverage = 50%)
+        // - Total: $L * (1 + 1/leverage)
+        // - So: LP value = totalCapital / (1 + 1/leverage)
+        const lpValueUsd = totalCapitalUsd / (1 + 1 / leverage);
+        const hedgeCollateralUsd = lpValueUsd / leverage;
+        const swapAmountUsd = lpValueUsd / 2; // Half goes to TSLAx
+        const lpUsdcSideUsd = lpValueUsd / 2; // Half stays as USDC for LP
 
         log.info({
             event: 'bootstrap_starting',
-            investmentUsd,
+            totalCapitalUsd,
+            lpValueUsd: lpValueUsd.toFixed(2),
+            hedgeCollateralUsd: hedgeCollateralUsd.toFixed(2),
+            swapAmountUsd: swapAmountUsd.toFixed(2),
+            leverage,
             currentPrice,
             rangePercent,
         });
 
         try {
-            // Step 1: Swap half of USDC to TSLAx for LP
-            // LP needs 50/50 value split
-            const swapAmountUsd = investmentUsd / 2;
+            // Step 1: Swap portion of USDC to TSLAx for LP
             const swapAmountMicro = BigInt(Math.floor(swapAmountUsd * 1_000_000)); // USDC has 6 decimals
 
-            log.info({ event: 'bootstrap_swapping', amountUsd: swapAmountUsd });
+            log.info({ event: 'bootstrap_swapping', amountUsd: swapAmountUsd.toFixed(2) });
 
             const swapResult = await this.jupiterClient.swapUsdcToTslax(swapAmountMicro);
             if (!swapResult) {
@@ -451,9 +464,10 @@ export class Orchestrator {
             });
 
             // Step 3: Open matching hedge
-            // LP creates long exposure equal to the TSLAx value
-            const hedgeSize = swapAmountUsd;
-            const collateral = hedgeSize / config.DEFAULT_LEVERAGE;
+            // Hedge size = LP value (to be delta neutral)
+            // Collateral already calculated based on leverage
+            const hedgeSize = lpValueUsd;
+            const collateral = hedgeCollateralUsd;
 
             log.info({
                 event: 'bootstrap_opening_hedge',
@@ -483,12 +497,13 @@ export class Orchestrator {
             // Mark bootstrap as complete
             this.hasBootstrapped = true;
 
-            alertInfo('BOOTSTRAP_COMPLETE', `Initial position created: $${investmentUsd} deployed`);
+            alertInfo('BOOTSTRAP_COMPLETE', `Initial position created: $${totalCapitalUsd} deployed`);
             log.info({
                 event: 'bootstrap_complete',
-                totalInvestment: investmentUsd,
-                lpValue: swapAmountUsd,
+                totalCapitalUsd,
+                lpValueUsd,
                 hedgeSize,
+                hedgeCollateralUsd,
             });
 
             return true;

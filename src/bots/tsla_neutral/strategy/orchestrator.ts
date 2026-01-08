@@ -518,15 +518,19 @@ export class Orchestrator {
             });
 
             // Step 3: Open matching hedge
-            // Hedge size = LP value (to be delta neutral)
-            // Collateral already calculated based on leverage
-            const hedgeSize = lpValueUsd;
-            const collateral = hedgeCollateralUsd;
+            // Hedge size should match ACTUAL TSLAx value received (accounting for swap slippage)
+            // TSLAx has 9 decimals, so: actualTslaxValue = tslaxAmount / 1e9 * currentPrice
+            const actualTslaxValueUsd = (Number(tslaxAmount) / 1e9) * currentPrice;
+            const hedgeSize = actualTslaxValueUsd;
+            // Collateral = hedge size / leverage, but we only have what's left after swap
+            // Available: original hedgeCollateralUsd (we didn't touch this in the swap)
+            const collateral = Math.min(hedgeCollateralUsd, hedgeSize / config.DEFAULT_LEVERAGE);
 
             log.info({
                 event: 'bootstrap_opening_hedge',
-                hedgeSizeUsd: hedgeSize,
-                collateralUsd: collateral,
+                actualTslaxValueUsd: actualTslaxValueUsd.toFixed(2),
+                hedgeSizeUsd: hedgeSize.toFixed(2),
+                collateralUsd: collateral.toFixed(2),
             });
 
             const hedgeResult = await this.flashTradeClient.openShortPosition(

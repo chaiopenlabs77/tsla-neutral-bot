@@ -424,10 +424,25 @@ export class LPClient {
             // Execute the transaction
             const { txId } = await execute();
 
+            // Verify transaction succeeded on-chain
+            const connection = this.raydium.connection;
+            const confirmation = await connection.getSignatureStatus(txId, { searchTransactionHistory: true });
+
+            if (confirmation.value?.err) {
+                log.error({
+                    event: 'lp_tx_failed_onchain',
+                    txSignature: txId,
+                    error: JSON.stringify(confirmation.value.err),
+                });
+                txSubmittedCounter.inc({ type: 'open_lp', status: 'failure' });
+                return null;
+            }
+
             log.info({
                 event: 'lp_position_opened',
                 txSignature: txId,
                 nftMint: extInfo?.nftMint?.toBase58(),
+                confirmationStatus: confirmation.value?.confirmationStatus,
             });
             txSubmittedCounter.inc({ type: 'open_lp', status: 'success' });
 

@@ -469,40 +469,59 @@ export class Orchestrator {
         });
 
         try {
-            // Step 1: Swap portion of USDC to TSLAx for LP
-            const swapAmountMicro = BigInt(Math.floor(swapAmountUsd * 1_000_000)); // USDC has 6 decimals
+            // Step 1: Check if we already have TSLAx (from previous failed attempt)
+            let tslaxAmount: bigint;
+            const { getAssociatedTokenAddress } = await import('@solana/spl-token');
 
-            log.info({ event: 'bootstrap_swapping', amountUsd: swapAmountUsd.toFixed(2) });
-
-            const swapResult = await this.jupiterClient.swapUsdcToTslax(swapAmountMicro);
-            if (!swapResult) {
-                log.error({ event: 'bootstrap_swap_failed' });
-                alertWarning('BOOTSTRAP_FAILED', 'Failed to swap USDC to TSLAx');
-                return false;
+            try {
+                const tslaxAta = await getAssociatedTokenAddress(config.TSLAX_MINT, this.wallet.publicKey);
+                const tslaxInfo = await connection.getTokenAccountBalance(tslaxAta);
+                tslaxAmount = BigInt(tslaxInfo.value.amount);
+            } catch {
+                tslaxAmount = 0n; // No TSLAx account exists
             }
 
-            log.info({
-                event: 'bootstrap_swap_complete',
-                txSignature: swapResult.txSignature,
-                tslaxReceived: swapResult.tslaxAmount,
-            });
+            if (tslaxAmount > 0n) {
+                log.info({
+                    event: 'bootstrap_using_existing_tslax',
+                    amount: tslaxAmount.toString(),
+                    msg: 'Using existing TSLAx from previous attempt'
+                });
+            } else {
+                // No TSLAx, need to swap
+                const swapAmountMicro = BigInt(Math.floor(swapAmountUsd * 1_000_000));
+                log.info({ event: 'bootstrap_swapping', amountUsd: swapAmountUsd.toFixed(2) });
+
+                const swapResult = await this.jupiterClient.swapUsdcToTslax(swapAmountMicro);
+                if (!swapResult) {
+                    log.error({ event: 'bootstrap_swap_failed' });
+                    alertWarning('BOOTSTRAP_FAILED', 'Failed to swap USDC to TSLAx');
+                    return false;
+                }
+
+                log.info({
+                    event: 'bootstrap_swap_complete',
+                    txSignature: swapResult.txSignature,
+                    tslaxReceived: swapResult.tslaxAmount,
+                });
+
+                tslaxAmount = BigInt(swapResult.tslaxAmount);
+            }
 
             // Step 2: Open LP position
-            // TSLAx has 9 decimals, USDC has 6 decimals
-            // We received tslaxAmount from the swap, and we'll use remaining USDC
-            const tslaxAmount = BigInt(swapResult.tslaxAmount);
-            const usdcAmount = swapAmountMicro; // Same amount of USDC for the other side
+            // TSLAx has 8 decimals (not 9!), USDC has 6 decimals
+            const usdcAmountMicro = BigInt(Math.floor(lpUsdcSideUsd * 1_000_000));
 
             log.info({
                 event: 'bootstrap_opening_lp',
                 tslaxAmount: tslaxAmount.toString(),
-                usdcAmount: usdcAmount.toString(),
+                usdcAmount: usdcAmountMicro.toString(),
                 rangePercent,
             });
 
             const lpResult = await this.lpClient.openPosition(
                 tslaxAmount,
-                usdcAmount,
+                usdcAmountMicro,
                 rangePercent
             );
 
@@ -518,12 +537,9 @@ export class Orchestrator {
             });
 
             // Step 3: Open matching hedge
-            // Hedge size should match ACTUAL TSLAx value received (accounting for swap slippage)
-            // TSLAx has 9 decimals, so: actualTslaxValue = tslaxAmount / 1e9 * currentPrice
-            const actualTslaxValueUsd = (Number(tslaxAmount) / 1e9) * currentPrice;
+            // Hedge size should match ACTUAL TSLAx value (TSLAx has 8 decimals)
+            const actualTslaxValueUsd = (Number(tslaxAmount) / 1e8) * currentPrice;
             const hedgeSize = actualTslaxValueUsd;
-            // Collateral = hedge size / leverage, but we only have what's left after swap
-            // Available: original hedgeCollateralUsd (we didn't touch this in the swap)
             const collateral = Math.min(hedgeCollateralUsd, hedgeSize / config.DEFAULT_LEVERAGE);
 
             log.info({
@@ -542,8 +558,7 @@ export class Orchestrator {
             if (!hedgeResult) {
                 log.error({ event: 'bootstrap_hedge_failed' });
                 alertWarning('BOOTSTRAP_FAILED', 'Failed to open hedge position');
-                // Note: LP is already open, but we failed to hedge. 
-                // This is a partial success - the next cycle will detect the imbalance
+                // LP is already open - next cycle will detect imbalance
                 return false;
             }
 
@@ -555,7 +570,7 @@ export class Orchestrator {
             // Mark bootstrap as complete
             this.hasBootstrapped = true;
 
-            alertInfo('BOOTSTRAP_COMPLETE', `Initial position created: $${totalCapitalUsd} deployed`);
+            alertInfo('BOOTSTRAP_COMPLETE', `Initial position created: $${totalCapitalUsd.toFixed(2)} deployed`);
             log.info({
                 event: 'bootstrap_complete',
                 totalCapitalUsd,
@@ -573,9 +588,7 @@ export class Orchestrator {
             alerts.txFailure('bootstrap', error instanceof Error ? error.message : String(error));
             return false;
         }
-    }
-
-    /**
+    }/**
      * Run a dry-run cycle (no actual trades).
      */
     private async runDryRunCycle(): Promise<void> {

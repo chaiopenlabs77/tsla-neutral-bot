@@ -266,9 +266,12 @@ export class FlashTradeClient {
                 exponent: -5, // Flash Trade uses -5 exponent
             };
 
-            // Convert amounts to BN with proper decimals
-            const sizeBN = new BN(Math.floor(sizeUsd * 1e6));
-            const collateralBN = new BN(Math.floor(collateralUsd * 1e6));
+            // Convert USD size to token amount
+            // Flash Trade expects sizeAmount in token terms (9 decimals), not USD
+            // tokenAmount = sizeUsd / price
+            const tokenAmount = sizeUsd / currentPrice;
+            const sizeBN = new BN(Math.floor(tokenAmount * 1e9)); // 9 decimals for token amount
+            const collateralBN = new BN(Math.floor(collateralUsd * 1e6)); // 6 decimals for USDC
 
             log.info({
                 event: 'open_position_params',
@@ -277,7 +280,8 @@ export class FlashTradeClient {
                 price: priceObj.price.toString(),
                 exponent: priceObj.exponent,
                 collateral: collateralBN.toString(),
-                size: sizeBN.toString(),
+                sizeTokens: sizeBN.toString(),
+                sizeUsd: sizeUsd.toFixed(2),
                 side: 'short',
                 poolAddress: this.poolConfig?.poolAddress?.toBase58(),
             });
@@ -410,8 +414,10 @@ export class FlashTradeClient {
                 exponent: -5,
             };
 
-            // Size delta in 6 decimals
-            const sizeDeltaBN = new BN(Math.floor(additionalSizeUsd * 1e6));
+            // Convert USD size to token amount (same as openShortPosition)
+            // Flash Trade expects sizeAmount in token terms (9 decimals), not USD
+            const tokenAmount = additionalSizeUsd / currentPrice;
+            const sizeDeltaBN = new BN(Math.floor(tokenAmount * 1e9)); // 9 decimals for token amount
 
             log.info({
                 event: 'increase_position_params',
@@ -419,7 +425,8 @@ export class FlashTradeClient {
                 collateralSymbol: COLLATERAL_SYMBOL,
                 positionPubKey,
                 price: priceObj.price.toString(),
-                sizeDelta: sizeDeltaBN.toString(),
+                sizeDeltaTokens: sizeDeltaBN.toString(),
+                sizeDeltaUsd: additionalSizeUsd.toFixed(2),
                 side: 'short',
             });
 

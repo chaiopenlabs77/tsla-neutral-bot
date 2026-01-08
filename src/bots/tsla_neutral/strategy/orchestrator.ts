@@ -482,6 +482,14 @@ export class Orchestrator {
         });
 
         try {
+            // Step 0: Ensure we have enough SOL for rent/fees
+            const hasSol = await this.jupiterClient.ensureSolBalance();
+            if (!hasSol) {
+                log.error({ event: 'bootstrap_failed', reason: 'insufficient_sol_for_rent' });
+                alertWarning('BOOTSTRAP_FAILED', 'Could not ensure SOL balance for rent');
+                return false;
+            }
+
             // Step 1: Check existing TSLAx balance
             const { getAssociatedTokenAddress, TOKEN_2022_PROGRAM_ID } = await import('@solana/spl-token');
 

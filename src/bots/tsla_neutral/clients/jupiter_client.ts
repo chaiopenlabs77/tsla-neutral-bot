@@ -291,4 +291,56 @@ export class JupiterClient {
 
     return Number(quote.outAmount) / 10 ** outDecimals;
   }
+
+  /**
+   * Ensure wallet has minimum SOL balance for rent/fees.
+   * If below minimum, swaps USDC to SOL.
+   * 
+   * @param minSolLamports - Minimum SOL balance in lamports (default: 0.05 SOL)
+   * @param topUpLamports - Amount to top up if below minimum (default: 0.1 SOL)
+   * @returns True if balance is sufficient or top-up succeeded
+   */
+  async ensureSolBalance(
+    minSolLamports: bigint = 50_000_000n, // 0.05 SOL
+    topUpLamports: bigint = 100_000_000n // 0.1 SOL
+  ): Promise<boolean> {
+    this.ensureInitialized();
+
+    const solBalance = await this.connection.getBalance(this.wallet!.publicKey);
+
+    if (BigInt(solBalance) >= minSolLamports) {
+      log.info({
+        event: 'sol_balance_sufficient',
+        balance: (solBalance / 1e9).toFixed(4),
+        minRequired: (Number(minSolLamports) / 1e9).toFixed(4),
+      });
+      return true;
+    }
+
+    // Need to top up - calculate USDC needed
+    // Get SOL price in USDC (approx $200/SOL)
+    const solPrice = await this.getPrice(TOKEN_MINTS.SOL, TOKEN_MINTS.USDC);
+    const usdcNeeded = Math.ceil((Number(topUpLamports) / 1e9) * solPrice * 1e6); // In USDC micros
+
+    log.info({
+      event: 'sol_top_up_required',
+      currentBalance: (solBalance / 1e9).toFixed(4),
+      minRequired: (Number(minSolLamports) / 1e9).toFixed(4),
+      topUpAmount: (Number(topUpLamports) / 1e9).toFixed(4),
+      usdcNeeded: (usdcNeeded / 1e6).toFixed(2),
+    });
+
+    const result = await this.swapUsdcToSol(BigInt(usdcNeeded));
+    if (result) {
+      log.info({
+        event: 'sol_top_up_success',
+        txSignature: result.txSignature,
+        solReceived: (Number(result.solAmount) / 1e9).toFixed(4),
+      });
+      return true;
+    }
+
+    log.error({ event: 'sol_top_up_failed' });
+    return false;
+  }
 }

@@ -62,7 +62,7 @@ export const config = {
     // ──────────────────────────────────────────────────────────────────────────
     // Pool & Token Addresses (Raydium CLMM)
     // ──────────────────────────────────────────────────────────────────────────
-    TSLAX_MINT: new PublicKey(optionalEnv('TSLAX_MINT', 'TSLAxMGPCpLeQahyN6NnfpF4SMJa4cLSLdKEVjPJmAP')),
+    TSLAX_MINT: new PublicKey(optionalEnv('TSLAX_MINT', 'XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB')),
     USDC_MINT: new PublicKey(optionalEnv('USDC_MINT', 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v')),
     RAYDIUM_POOL_ADDRESS: new PublicKey(optionalEnv('RAYDIUM_POOL_ADDRESS', '11111111111111111111111111111111')), // Placeholder
 

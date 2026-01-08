@@ -161,16 +161,19 @@ export class JupiterClient {
     }
 
     try {
+      // Strip platformFee from quote if present - it requires a feeAccount we don't have
+      const cleanQuote = { ...quote } as Record<string, unknown>;
+      delete cleanQuote.platformFee;
+
       // Get serialized swap transaction
       const swapResponse = await fetch(JUPITER_SWAP_API, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          quoteResponse: quote,
+          quoteResponse: cleanQuote,
           userPublicKey: this.wallet!.publicKey.toBase58(),
           wrapAndUnwrapSol: true,
           dynamicComputeUnitLimit: true,
-          prioritizationFeeLamports: config.JITO_TIP_LAMPORTS,
         }),
       });
 

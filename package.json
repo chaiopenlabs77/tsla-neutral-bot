@@ -1,0 +1,39 @@
+{
+  "name": "tachyon-rocket",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dev": "ts-node src/bots/tsla_neutral/index.ts",
+    "build": "tsc",
+    "start": "node dist/bots/tsla_neutral/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "@types/node": "^25.0.3",
+    "jest": "^30.2.0",
+    "ts-jest": "^29.4.6",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.32.1",
+    "@pythnetwork/hermes-client": "^2.1.0",
+    "@pythnetwork/price-service-client": "^1.10.0",
+    "@raydium-io/raydium-sdk-v2": "^0.2.32-alpha",
+    "@solana/web3.js": "^1.98.4",
+    "dotenv": "^17.2.3",
+    "flash-sdk": "^11.5.2",
+    "ioredis": "^5.9.0",
+    "pino": "^10.1.0",
+    "prom-client": "^15.1.3"
+  }
+}

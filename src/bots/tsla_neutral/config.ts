@@ -127,17 +127,17 @@ export const config = {
     RECONCILIATION_INTERVAL_MS: optionalEnvNumber('RECONCILIATION_INTERVAL_MS', 300000), // 5 minutes
 
     // US Market Hours (Eastern Time)
-    // Market opens 9:30 AM ET, closes 4:00 PM ET
+    // Actual market: 9:30 AM - 4:00 PM ET
+    // Bot times: Open at 9:15 AM, Close at 3:45 PM
     MARKET_OPEN_HOUR_ET: optionalEnvNumber('MARKET_OPEN_HOUR_ET', 9),  // 9 AM ET
-    MARKET_OPEN_MINUTE_ET: optionalEnvNumber('MARKET_OPEN_MINUTE_ET', 30), // 9:30 AM ET
-    MARKET_CLOSE_HOUR_ET: optionalEnvNumber('MARKET_CLOSE_HOUR_ET', 16), // 4 PM ET
-    MARKET_CLOSE_MINUTE_ET: optionalEnvNumber('MARKET_CLOSE_MINUTE_ET', 0), // 4:00 PM ET
+    MARKET_OPEN_MINUTE_ET: optionalEnvNumber('MARKET_OPEN_MINUTE_ET', 15), // 9:15 AM ET
+    MARKET_CLOSE_HOUR_ET: optionalEnvNumber('MARKET_CLOSE_HOUR_ET', 15), // 3 PM ET
+    MARKET_CLOSE_MINUTE_ET: optionalEnvNumber('MARKET_CLOSE_MINUTE_ET', 45), // 3:45 PM ET
 
-    // Buffer times (minutes)
-    // Bot opens positions at MARKET_OPEN + buffer
-    // Bot closes positions at MARKET_CLOSE - buffer
-    MARKET_OPEN_BUFFER_MINS: optionalEnvNumber('MARKET_OPEN_BUFFER_MINS', 15), // Open at 9:45 AM
-    MARKET_CLOSE_BUFFER_MINS: optionalEnvNumber('MARKET_CLOSE_BUFFER_MINS', 15), // Unwind at 3:45 PM
+    // Buffer times (minutes) - set to 0 since times are already adjusted
+    // These are additional offsets: bot opens at OPEN + buffer, closes at CLOSE - buffer
+    MARKET_OPEN_BUFFER_MINS: optionalEnvNumber('MARKET_OPEN_BUFFER_MINS', 0), // Open at 9:15 AM
+    MARKET_CLOSE_BUFFER_MINS: optionalEnvNumber('MARKET_CLOSE_BUFFER_MINS', 0), // Unwind at 3:45 PM
 
     // Slippage protection for EOD swap
     EOD_SWAP_MAX_SLIPPAGE_PERCENT: optionalEnvNumber('EOD_SWAP_MAX_SLIPPAGE_PERCENT', 1.0), // Skip if >1%

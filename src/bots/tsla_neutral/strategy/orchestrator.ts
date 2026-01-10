@@ -19,7 +19,7 @@ import { LPClient } from '../clients/lp_client';
 import { FlashTradeClient } from '../clients/flash_trade_client';
 import { PythClient } from '../clients/pyth_client';
 import { JupiterClient, TOKEN_MINTS } from '../clients/jupiter_client';
-import { Keypair, Connection } from '@solana/web3.js';
+import { Keypair, Connection, PublicKey } from '@solana/web3.js';
 import bs58 from 'bs58';
 
 const log = loggers.orchestrator;
@@ -38,8 +38,174 @@ export class Orchestrator {
     private wallet: Keypair | null = null;
     private hasBootstrapped = false;
 
+    // EOD tracking
+    private eodUnwindCompleted = false;
+    private lastTradingDay = '';
+
     constructor() {
         this.pythClient = new PythClient();
+    }
+
+    /**
+     * Check if current time is within trading hours (9:15 AM - 3:45 PM ET).
+     */
+    private isWithinTradingHours(): boolean {
+        const now = new Date();
+        // Convert to ET (handle DST automatically)
+        const et = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+        const hour = et.getHours();
+        const minute = et.getMinutes();
+        const currentMinutes = hour * 60 + minute;
+
+        const openMinutes = config.MARKET_OPEN_HOUR_ET * 60 + config.MARKET_OPEN_MINUTE_ET;
+        const closeMinutes = config.MARKET_CLOSE_HOUR_ET * 60 + config.MARKET_CLOSE_MINUTE_ET;
+
+        // Check if weekend
+        const dayOfWeek = et.getDay();
+        if (dayOfWeek === 0 || dayOfWeek === 6) {
+            return false;
+        }
+
+        return currentMinutes >= openMinutes && currentMinutes <= closeMinutes;
+    }
+
+    /**
+     * Check if it's time to open positions (at market open time).
+     */
+    private shouldOpenPosition(): boolean {
+        const now = new Date();
+        const et = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+        const hour = et.getHours();
+        const minute = et.getMinutes();
+
+        // Check if it's market open time (within first 5 minutes of trading window)
+        const openHour = config.MARKET_OPEN_HOUR_ET;
+        const openMinute = config.MARKET_OPEN_MINUTE_ET;
+
+        return hour === openHour && minute >= openMinute && minute <= openMinute + 5;
+    }
+
+    /**
+     * Check if it's time to unwind (at market close time).
+     */
+    private shouldUnwind(): boolean {
+        const now = new Date();
+        const et = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+        const today = et.toISOString().split('T')[0];
+
+        // Reset flag for new day
+        if (this.lastTradingDay !== today) {
+            this.lastTradingDay = today;
+            this.eodUnwindCompleted = false;
+        }
+
+        // Already unwound today
+        if (this.eodUnwindCompleted) {
+            return false;
+        }
+
+        const hour = et.getHours();
+        const minute = et.getMinutes();
+
+        // Check if it's within 5 minutes of close time (3:45-3:50 PM)
+        const closeHour = config.MARKET_CLOSE_HOUR_ET;
+        const closeMinute = config.MARKET_CLOSE_MINUTE_ET;
+
+        return hour === closeHour && minute >= closeMinute && minute <= closeMinute + 5;
+    }
+
+    /**
+     * Get current ET time string for logging.
+     */
+    private getCurrentET(): string {
+        const now = new Date();
+        return now.toLocaleString('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: true });
+    }
+
+    /**
+     * Perform End-of-Day unwind: close all positions and swap TSLAx to USDC.
+     */
+    private async performEodUnwind(): Promise<void> {
+        log.info({ event: 'eod_unwind_starting', et: this.getCurrentET() });
+
+        // Get current price for slippage calculations
+        let currentPrice = 0;
+        try {
+            const priceData = await this.pythClient.getTSLAPrice();
+            if (priceData) {
+                currentPrice = priceData.price;
+            }
+        } catch (error) {
+            log.warn({ event: 'pyth_price_error_eod', error: String(error) });
+        }
+
+        // 1. Close Flash Trade hedge positions
+        if (this.flashTradeClient) {
+            try {
+                log.info({ event: 'eod_closing_flash_trade' });
+                const result = await this.flashTradeClient.closePosition(config.MAX_SLIPPAGE_BPS, currentPrice || undefined);
+                if (result) {
+                    log.info({ event: 'flash_trade_closed', tx: result.txSignature });
+                }
+            } catch (error) {
+                log.error({ event: 'flash_trade_close_error', error: String(error) });
+            }
+        }
+
+        // 2. Close LP positions
+        if (this.lpClient) {
+            try {
+                log.info({ event: 'eod_closing_lp_positions' });
+                const positions = await this.lpClient.fetchPositions();
+                for (const pos of positions) {
+                    // LPPosition.mint is the NFT mint for the position
+                    const result = await this.lpClient.closePosition(pos.mint);
+                    if (result) {
+                        log.info({ event: 'lp_position_closed', tx: result.txSignature });
+                    }
+                }
+            } catch (error) {
+                log.error({ event: 'lp_close_error', error: String(error) });
+            }
+        }
+
+        // 3. Swap any remaining TSLAx to USDC
+        if (this.jupiterClient && this.wallet) {
+            try {
+                // Get TSLAx balance via SPL token balance check
+                const tslaxMint = new PublicKey(TOKEN_MINTS.TSLAX);
+                const tokenAccounts = await this.jupiterClient['connection'].getTokenAccountsByOwner(
+                    this.wallet.publicKey,
+                    { mint: tslaxMint }
+                );
+
+                let tslaxBalance = 0n;
+                if (tokenAccounts.value.length > 0) {
+                    const accountInfo = tokenAccounts.value[0];
+                    const data = accountInfo.account.data;
+                    // SPL token amount is at offset 64, 8 bytes
+                    tslaxBalance = data.readBigUInt64LE(64);
+                }
+
+                if (tslaxBalance > 1000n) { // Only swap if significant (> 0.001 TSLAx)
+                    log.info({ event: 'eod_swapping_tslax', balance: Number(tslaxBalance) / 1e6 });
+                    const result = await this.jupiterClient.swapTslaxToUsdc(
+                        tslaxBalance,
+                        config.EOD_SWAP_MAX_SLIPPAGE_PERCENT * 100 // Convert to bps
+                    );
+                    if (result) {
+                        log.info({ event: 'tslax_swapped', tx: result.txSignature });
+                    }
+                }
+            } catch (error) {
+                log.error({ event: 'tslax_swap_error', error: String(error) });
+            }
+        }
+
+        // Reset bootstrap flag for next day
+        this.hasBootstrapped = false;
+
+        log.info({ event: 'eod_unwind_complete' });
     }
 
     /**
@@ -172,7 +338,24 @@ export class Orchestrator {
             return;
         }
 
-        log.debug({ event: 'cycle_start', cycle: this.cycleCount });
+        log.debug({ event: 'cycle_start', cycle: this.cycleCount, et: this.getCurrentET() });
+
+        // ===== MARKET HOURS CHECK =====
+        const withinHours = this.isWithinTradingHours();
+
+        // Check if it's time for EOD unwind
+        if (this.shouldUnwind()) {
+            log.info({ event: 'eod_unwind_triggered', et: this.getCurrentET() });
+            await this.performEodUnwind();
+            this.eodUnwindCompleted = true;
+            return;
+        }
+
+        // Outside trading hours - just monitor
+        if (!withinHours) {
+            log.debug({ event: 'outside_trading_hours', et: this.getCurrentET(), nextOpen: `${config.MARKET_OPEN_HOUR_ET}:${config.MARKET_OPEN_MINUTE_ET}` });
+            return;
+        }
 
         // In DRY_RUN mode, just log what we would do
         if (config.DRY_RUN) {

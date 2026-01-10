@@ -317,6 +317,7 @@ export class FlashTradeClient {
 
     /**
  * Close an existing short position.
+ * Includes Pyth price update for after-hours operation.
  */
     async closePosition(
         maxSlippageBps: number = config.MAX_SLIPPAGE_BPS,
@@ -352,6 +353,23 @@ export class FlashTradeClient {
                 exponent: -5, // Flash Trade uses -5 exponent
             };
 
+            // Fetch fresh Pyth prices and create update instructions
+            // This is required for after-hours operations when oracle price may be stale
+            const flashSdk = await import('flash-sdk');
+            let pythUpdateInstructions: TransactionInstruction[] = [];
+            try {
+                const poolAddress = this.poolConfig.poolAddress?.toBase58();
+                log.info({ event: 'fetching_pyth_backup_oracle', poolAddress });
+                pythUpdateInstructions = await flashSdk.createBackupOracleInstruction(poolAddress, true);
+                log.info({ event: 'pyth_update_instructions_created', count: pythUpdateInstructions.length });
+            } catch (pythError) {
+                log.warn({
+                    event: 'pyth_backup_oracle_fetch_failed',
+                    error: pythError instanceof Error ? pythError.message : String(pythError),
+                    msg: 'Proceeding without Pyth update - may fail if oracle is stale',
+                });
+            }
+
             const { instructions, additionalSigners } = await this.perpClient.closePosition(
                 this.targetSymbol,
                 COLLATERAL_SYMBOL,
@@ -361,7 +379,10 @@ export class FlashTradeClient {
                 { none: {} }
             );
 
-            const txSignature = await this.buildAndSendTransaction(instructions, additionalSigners);
+            // Prepend Pyth update instructions before the close instruction
+            const allInstructions = [...pythUpdateInstructions, ...instructions];
+
+            const txSignature = await this.buildAndSendTransaction(allInstructions, additionalSigners);
 
             log.info({ event: 'position_closed', txSignature });
             txSubmittedCounter.inc({ type: 'close_position', status: 'success' });

@@ -17,6 +17,10 @@ import {
     TransactionInstruction,
     Signer,
 } from '@solana/web3.js';
+import {
+    getAssociatedTokenAddress,
+    createAssociatedTokenAccountInstruction,
+} from '@solana/spl-token';
 import { config } from '../config';
 import { LPPosition } from '../types';
 import { loggers } from '../observability/logger';
@@ -545,10 +549,24 @@ export class LPClient {
         }
 
         try {
-            // Get pool info with poolKeys
-            const poolData = await this.raydium.clmm.getPoolInfoFromRpc(this.poolAddress.toBase58());
-            const poolInfo = poolData.poolInfo;
-            const poolKeys = poolData.poolKeys;
+            // Use API for poolInfo (has rewardDefaultInfos) and RPC for poolKeys
+            // RPC alone returns empty rewardDefaultInfos which causes error 6035
+            log.info({ event: 'fetching_pool_data_api' });
+            const apiData = await this.raydium.api.fetchPoolById({ ids: this.poolAddress.toBase58() });
+            const poolInfo = apiData[0];
+
+            if (!poolInfo) {
+                throw new Error(`Pool not found via API: ${this.poolAddress.toBase58()}`);
+            }
+
+            // Get poolKeys from RPC (required for transaction building)
+            const rpcData = await this.raydium.clmm.getPoolInfoFromRpc(this.poolAddress.toBase58());
+            const poolKeys = rpcData.poolKeys;
+
+            log.info({
+                event: 'pool_data_fetched',
+                rewardDefaultInfosCount: poolInfo.rewardDefaultInfos?.length || 0,
+            });
 
             // Get all owner positions and find the one matching our NFT mint
             const allPositions = await this.raydium.clmm.getOwnerPositionInfo({
@@ -578,26 +596,92 @@ export class LPClient {
                 event: 'found_position_to_close',
                 nftMint: position.nftMint?.toBase58(),
                 poolId: position.poolId?.toBase58(),
+            });
+
+            // Create ATAs for any reward tokens before closing
+            // Pool has RAY rewards that need an ATA to receive
+            const computePoolInfo = rpcData.computePoolInfo;
+            if (computePoolInfo?.rewardInfos && this.wallet) {
+                for (const rewardInfo of computePoolInfo.rewardInfos) {
+                    const tokenMint = rewardInfo.tokenMint;
+                    // Skip empty reward slots (address is 111...111)
+                    if (!tokenMint || tokenMint.toBase58() === '11111111111111111111111111111111') {
+                        continue;
+                    }
+
+                    const ata = await getAssociatedTokenAddress(tokenMint, this.wallet.publicKey);
+                    const accountInfo = await this.connection.getAccountInfo(ata);
+
+                    if (!accountInfo) {
+                        log.info({ event: 'creating_reward_ata', mint: tokenMint.toBase58(), ata: ata.toBase58() });
+
+                        // Create ATA for reward token
+                        const createAtaIx = createAssociatedTokenAccountInstruction(
+                            this.wallet.publicKey, // payer
+                            ata, // ata address
+                            this.wallet.publicKey, // owner
+                            tokenMint // mint
+                        );
+
+                        const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash();
+                        const messageV0 = new TransactionMessage({
+                            payerKey: this.wallet.publicKey,
+                            recentBlockhash: blockhash,
+                            instructions: [createAtaIx],
+                        }).compileToV0Message();
+
+                        const tx = new VersionedTransaction(messageV0);
+                        tx.sign([this.wallet]);
+
+                        const signature = await this.connection.sendTransaction(tx, { maxRetries: 3 });
+                        await this.connection.confirmTransaction({ signature, blockhash, lastValidBlockHeight });
+                        log.info({ event: 'reward_ata_created', txSignature: signature });
+                    }
+                }
+            }
+
+            log.info({
                 liquidity: position.liquidity?.toString(),
             });
 
-            // Use decreaseLiquidity with closePosition:true to handle both
-            // liquidity withdrawal and position closing in one transaction
-            const { execute } = await this.raydium.clmm.decreaseLiquidity({
+            // Step 1: Decrease all liquidity first (without closing)
+            log.info({ event: 'step1_decreasing_liquidity', liquidity: position.liquidity?.toString() });
+            const { execute: executeDecrease } = await this.raydium.clmm.decreaseLiquidity({
                 poolInfo,
                 poolKeys,
                 ownerPosition: position,
                 ownerInfo: {
                     useSOLBalance: true,
-                    closePosition: true, // This closes the position after decreasing
+                    closePosition: false, // Don't close yet
+                    associatedOnly: true, // Use only ATAs
+                    checkCreateATAOwner: true, // Create ATAs if needed for reward tokens
                 },
                 liquidity: position.liquidity, // Decrease all liquidity
-                amountMinA: new BN(0), // Accept any amount (slippage handled elsewhere)
+                amountMinA: new BN(0),
                 amountMinB: new BN(0),
+                txVersion: 'V0',
+                computeBudgetConfig: {
+                    units: 800000,
+                    microLamports: 150000,
+                },
+            });
+
+            const { txId: decreaseTxId } = await executeDecrease({ sendAndConfirm: true });
+            log.info({ event: 'liquidity_decreased', txSignature: decreaseTxId });
+
+            // Wait a bit for the transaction to be fully confirmed
+            await new Promise(resolve => setTimeout(resolve, 2000));
+
+            // Step 2: Now close the empty position
+            log.info({ event: 'step2_closing_empty_position' });
+            const { execute: executeClose } = await this.raydium.clmm.closePosition({
+                poolInfo,
+                poolKeys,
+                ownerPosition: position,
                 txVersion: 'V0',
             });
 
-            const { txId } = await execute({ sendAndConfirm: true });
+            const { txId } = await executeClose({ sendAndConfirm: true });
 
             log.info({ event: 'lp_position_closed', txSignature: txId });
             txSubmittedCounter.inc({ type: 'close_lp', status: 'success' });

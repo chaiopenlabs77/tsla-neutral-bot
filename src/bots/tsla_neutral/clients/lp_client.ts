@@ -524,8 +524,9 @@ export class LPClient {
     }
 
     /**
-     * Close an LP position and collect fees.
-     */
+ * Close an LP position and collect fees.
+ * Uses the SDK's getOwnerPositionInfo to get full position object.
+ */
     async closePosition(positionNftMint: PublicKey): Promise<{ txSignature: string } | null> {
         this.ensureInitialized();
 
@@ -544,16 +545,59 @@ export class LPClient {
         }
 
         try {
-            // Close position and collect fees
-            const { execute } = await this.raydium.clmm.closePosition({
-                poolInfo: await this.raydium.clmm.getPoolInfoFromRpc(this.poolAddress.toBase58()),
-                ownerPosition: {
-                    nftMint: positionNftMint,
+            // Get pool info with poolKeys
+            const poolData = await this.raydium.clmm.getPoolInfoFromRpc(this.poolAddress.toBase58());
+            const poolInfo = poolData.poolInfo;
+            const poolKeys = poolData.poolKeys;
+
+            // Get all owner positions and find the one matching our NFT mint
+            const allPositions = await this.raydium.clmm.getOwnerPositionInfo({
+                programId: poolInfo.programId,
+            });
+
+            log.info({
+                event: 'fetched_owner_positions',
+                count: allPositions.length,
+                targetNftMint: positionNftMint.toBase58(),
+            });
+
+            // Find the position matching our NFT mint
+            const position = allPositions.find(
+                (p: any) => p.nftMint?.toBase58() === positionNftMint.toBase58()
+            );
+
+            if (!position) {
+                log.error({
+                    event: 'position_not_found',
+                    nftMint: positionNftMint.toBase58(),
+                });
+                return null;
+            }
+
+            log.info({
+                event: 'found_position_to_close',
+                nftMint: position.nftMint?.toBase58(),
+                poolId: position.poolId?.toBase58(),
+                liquidity: position.liquidity?.toString(),
+            });
+
+            // Use decreaseLiquidity with closePosition:true to handle both
+            // liquidity withdrawal and position closing in one transaction
+            const { execute } = await this.raydium.clmm.decreaseLiquidity({
+                poolInfo,
+                poolKeys,
+                ownerPosition: position,
+                ownerInfo: {
+                    useSOLBalance: true,
+                    closePosition: true, // This closes the position after decreasing
                 },
+                liquidity: position.liquidity, // Decrease all liquidity
+                amountMinA: new BN(0), // Accept any amount (slippage handled elsewhere)
+                amountMinB: new BN(0),
                 txVersion: 'V0',
             });
 
-            const { txId } = await execute();
+            const { txId } = await execute({ sendAndConfirm: true });
 
             log.info({ event: 'lp_position_closed', txSignature: txId });
             txSubmittedCounter.inc({ type: 'close_lp', status: 'success' });
@@ -568,7 +612,6 @@ export class LPClient {
             return null;
         }
     }
-
     /**
      * Calculate LP position delta (exposure to token A in USD terms).
      * Delta = TSLAx exposure value in USD (positive = long TSLAx)

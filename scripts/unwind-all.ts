@@ -63,7 +63,7 @@ async function main() {
     await lpClient.initialize(wallet);
     console.log('✓ LP Client initialized');
 
-    const flashTradeClient = new FlashTradeClient(connection);
+    const flashTradeClient = new FlashTradeClient(connection, 'TSLAr');
     await flashTradeClient.initialize(wallet);
     console.log('✓ Flash Trade Client initialized');
 

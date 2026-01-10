@@ -316,10 +316,11 @@ export class FlashTradeClient {
     }
 
     /**
-     * Close an existing short position.
-     */
+ * Close an existing short position.
+ */
     async closePosition(
-        maxSlippageBps: number = config.MAX_SLIPPAGE_BPS
+        maxSlippageBps: number = config.MAX_SLIPPAGE_BPS,
+        fallbackPrice?: number
     ): Promise<{ txSignature: string } | null> {
         this.ensureInitialized();
 
@@ -335,12 +336,20 @@ export class FlashTradeClient {
         }
 
         try {
-            const currentPrice = await this.getCurrentPrice();
+            // Get current price with slippage - use fallback if oracle returns 0
+            let currentPrice = await this.getCurrentPrice();
+            if (currentPrice === 0 && fallbackPrice) {
+                log.warn({ event: 'oracle_price_zero_close', fallback: 'using_fallback' });
+                currentPrice = fallbackPrice;
+            }
+            if (currentPrice === 0) {
+                throw new Error('Cannot close position: price is 0 and no fallback provided');
+            }
             const priceWithSlippage = currentPrice * (1 + maxSlippageBps / 10000);
 
             const priceObj = {
-                price: new BN(Math.floor(priceWithSlippage * 1e6)),
-                exponent: -6,
+                price: new BN(Math.floor(priceWithSlippage * 1e5)), // 1e5 for exponent -5
+                exponent: -5, // Flash Trade uses -5 exponent
             };
 
             const { instructions, additionalSigners } = await this.perpClient.closePosition(
@@ -367,7 +376,6 @@ export class FlashTradeClient {
             return null;
         }
     }
-
     /**
      * Increase an existing short position size.
      * Use this when a position already exists instead of openPosition.

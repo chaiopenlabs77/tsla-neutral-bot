@@ -1,20 +1,13 @@
 import { config } from '../config';
 
 /**
- * Check if current time is within quiet hours (Market Open volatility).
- * Uses UTC time from config.
+ * Note: Quiet hours functionality has been replaced by market hours logic
+ * in the orchestrator using MARKET_OPEN_HOUR_ET / MARKET_CLOSE_HOUR_ET.
+ * This stub remains for backwards compatibility.
  */
 export function isQuietHours(): boolean {
-    const now = new Date();
-    const currentUTC = now.getUTCHours() * 60 + now.getUTCMinutes();
-
-    const [startHour, startMin] = config.QUIET_HOURS_START_UTC.split(':').map(Number);
-    const [endHour, endMin] = config.QUIET_HOURS_END_UTC.split(':').map(Number);
-
-    const startMinutes = startHour * 60 + startMin;
-    const endMinutes = endHour * 60 + endMin;
-
-    return currentUTC >= startMinutes && currentUTC <= endMinutes;
+    // Quiet hours logic is now handled at the orchestrator level via TRADING_HOURS_ONLY
+    return false;
 }
 
 /**

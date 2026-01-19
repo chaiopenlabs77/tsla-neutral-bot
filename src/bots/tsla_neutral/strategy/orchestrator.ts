@@ -19,6 +19,7 @@ import { LPClient } from '../clients/lp_client';
 import { FlashTradeClient } from '../clients/flash_trade_client';
 import { PythClient } from '../clients/pyth_client';
 import { JupiterClient, TOKEN_MINTS } from '../clients/jupiter_client';
+import { getDataCollector, DataCollector } from '../infra/data_collector';
 import { Keypair, Connection, PublicKey } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -37,6 +38,7 @@ export class Orchestrator {
     private pythClient: PythClient;
     private wallet: Keypair | null = null;
     private hasBootstrapped = false;
+    private dataCollector: DataCollector;
 
     // EOD tracking
     private eodUnwindCompleted = false;
@@ -44,6 +46,7 @@ export class Orchestrator {
 
     constructor() {
         this.pythClient = new PythClient();
+        this.dataCollector = getDataCollector();
     }
 
     /**
@@ -216,6 +219,9 @@ export class Orchestrator {
 
         // Load state from Redis
         this.state = await loadState();
+
+        // Initialize data collector
+        await this.dataCollector.initialize();
 
         // Start RPC health checks
         getRpcManager().startHealthChecks();
@@ -460,6 +466,22 @@ export class Orchestrator {
                 rebalanceCounter.inc({ reason: decision.reason, status: 'failure' });
             }
         }
+
+        // 7. Record cycle data for analysis
+        this.dataCollector.recordCycle({
+            timestamp: Date.now(),
+            tslaPrice,
+            lpDelta,
+            hedgeDelta,
+            netDelta: decision.currentDelta,
+            isLpInRange,
+            poolApr: 0, // TODO: Fetch from Raydium API periodically
+            poolTvl: 0,
+            rebalanceTriggered: decision.shouldRebalance && !decision.blocked,
+            rebalanceReason: decision.reason,
+            rebalanceSizeUsd: decision.sizeToAdjust,
+            gasCostUsd: estimatedGasCost * 200, // Rough SOL to USD
+        });
 
         this.state = await recordSuccess(this.state);
     }

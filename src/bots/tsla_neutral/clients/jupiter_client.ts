@@ -301,8 +301,8 @@ export class JupiterClient {
    * @returns True if balance is sufficient or top-up succeeded
    */
   async ensureSolBalance(
-    minSolLamports: bigint = 50_000_000n, // 0.05 SOL
-    topUpLamports: bigint = 100_000_000n // 0.1 SOL
+    minSolLamports: bigint = 15_000_000n, // 0.015 SOL (enough for ~7 token accounts)
+    topUpLamports: bigint = 20_000_000n // 0.02 SOL (~$2.70)
   ): Promise<boolean> {
     this.ensureInitialized();
 

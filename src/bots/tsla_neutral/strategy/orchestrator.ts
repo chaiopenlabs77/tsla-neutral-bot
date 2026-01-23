@@ -172,7 +172,7 @@ export class Orchestrator {
             }
         }
 
-        // 3. Swap any remaining TSLAx to USDC
+        // 3. Swap any remaining TSLAx to USDC with retry
         if (this.jupiterClient && this.wallet) {
             try {
                 // Get TSLAx balance via SPL token balance check
@@ -192,12 +192,34 @@ export class Orchestrator {
 
                 if (tslaxBalance > 1000n) { // Only swap if significant (> 0.001 TSLAx)
                     log.info({ event: 'eod_swapping_tslax', balance: Number(tslaxBalance) / 1e6 });
-                    const result = await this.jupiterClient.swapTslaxToUsdc(
-                        tslaxBalance,
-                        config.EOD_SWAP_MAX_SLIPPAGE_PERCENT * 100 // Convert to bps
-                    );
-                    if (result) {
-                        log.info({ event: 'tslax_swapped', tx: result.txSignature });
+
+                    // Retry with escalating slippage: 50 -> 100 -> 200 -> 500 bps
+                    const slippageLevels = [50, 100, 200, 500];
+                    let swapSuccess = false;
+
+                    for (const slippageBps of slippageLevels) {
+                        try {
+                            log.info({ event: 'eod_swap_attempt', slippageBps });
+                            const result = await this.jupiterClient.swapTslaxToUsdc(tslaxBalance, slippageBps);
+                            if (result) {
+                                log.info({ event: 'tslax_swapped', tx: result.txSignature, slippageBps });
+                                swapSuccess = true;
+                                break;
+                            }
+                        } catch (swapError) {
+                            log.warn({
+                                event: 'eod_swap_retry',
+                                slippageBps,
+                                error: swapError instanceof Error ? swapError.message : String(swapError)
+                            });
+                            // Wait 2 seconds before retry with higher slippage
+                            await sleep(2000);
+                        }
+                    }
+
+                    if (!swapSuccess) {
+                        log.error({ event: 'eod_swap_all_retries_failed', balance: Number(tslaxBalance) / 1e6 });
+                        alertWarning('EOD_SWAP_FAILED', `Failed to swap ${(Number(tslaxBalance) / 1e6).toFixed(2)} TSLAx after 4 attempts`);
                     }
                 }
             } catch (error) {

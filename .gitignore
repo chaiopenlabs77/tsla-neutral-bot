@@ -4,3 +4,5 @@ dist/
 *.log
 .DS_Store
 coverage/
+google-credentials.json
+prediction-arb-bot/

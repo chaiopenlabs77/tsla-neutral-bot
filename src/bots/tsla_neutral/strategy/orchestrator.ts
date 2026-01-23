@@ -529,14 +529,51 @@ export class Orchestrator {
                 const availableUsdc = Number(accountInfo.value.amount) / 1_000_000;
 
                 if (availableUsdc < requiredCollateral) {
-                    log.warn({
-                        event: 'rebalance_skipped',
-                        reason: 'insufficient_collateral',
-                        required: requiredCollateral.toFixed(2),
-                        available: availableUsdc.toFixed(2),
+                    const shortfall = requiredCollateral - availableUsdc;
+                    const swapAmount = shortfall + 1; // Add $1 buffer
+
+                    log.info({
+                        event: 'auto_collateral_swap',
+                        shortfall: shortfall.toFixed(2),
+                        swapAmount: swapAmount.toFixed(2),
                     });
-                    alertWarning('REBALANCE_BLOCKED', `Insufficient USDC: need $${requiredCollateral.toFixed(2)}, have $${availableUsdc.toFixed(2)}`);
-                    return false;
+
+                    // Try to swap SOL to USDC via Jupiter
+                    if (this.jupiterClient) {
+                        try {
+                            // Convert USD to SOL amount (rough estimate: $200/SOL)
+                            const solPrice = 200; // TODO: fetch from Pyth
+                            const solNeeded = swapAmount / solPrice;
+                            const lamports = BigInt(Math.ceil(solNeeded * 1e9));
+
+                            const swapResult = await this.jupiterClient.swapSolToUsdc(lamports);
+                            if (swapResult) {
+                                log.info({
+                                    event: 'collateral_swap_success',
+                                    tx: swapResult.txSignature,
+                                    usdcReceived: swapResult.usdcAmount,
+                                });
+                                alertInfo('COLLATERAL_TOPPED_UP', `Swapped SOL for $${(Number(swapResult.usdcAmount) / 1e6).toFixed(2)} USDC`);
+                            } else {
+                                log.warn({ event: 'collateral_swap_failed' });
+                                alertWarning('REBALANCE_BLOCKED', `Could not swap for USDC collateral`);
+                                return false;
+                            }
+                        } catch (swapError) {
+                            log.warn({ event: 'collateral_swap_error', error: String(swapError) });
+                            alertWarning('REBALANCE_BLOCKED', `Insufficient USDC: need $${requiredCollateral.toFixed(2)}, have $${availableUsdc.toFixed(2)}`);
+                            return false;
+                        }
+                    } else {
+                        log.warn({
+                            event: 'rebalance_skipped',
+                            reason: 'insufficient_collateral',
+                            required: requiredCollateral.toFixed(2),
+                            available: availableUsdc.toFixed(2),
+                        });
+                        alertWarning('REBALANCE_BLOCKED', `Insufficient USDC: need $${requiredCollateral.toFixed(2)}, have $${availableUsdc.toFixed(2)}`);
+                        return false;
+                    }
                 }
             } catch (error) {
                 log.warn({ event: 'rebalance_balance_check_failed', error: String(error) });

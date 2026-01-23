@@ -398,7 +398,8 @@ export class Orchestrator {
                 log.debug({ event: 'lp_positions_fetched', count: lpPositions.length, totalDelta: lpDelta });
 
                 // Bootstrap: Create initial LP position if none exists
-                if (lpPositionCount === 0 && config.AUTO_BOOTSTRAP && !this.hasBootstrapped) {
+                // BUT NOT during EOD unwind window (3:45-3:50 PM ET)
+                if (lpPositionCount === 0 && config.AUTO_BOOTSTRAP && !this.hasBootstrapped && !this.shouldUnwind()) {
                     log.info({ event: 'bootstrap_check', noPositions: true, autoBootstrap: true });
                     await this.bootstrapPosition(tslaPrice);
                     return; // Wait for next cycle to process the new position

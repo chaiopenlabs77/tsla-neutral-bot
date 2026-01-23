@@ -44,6 +44,11 @@ export class Orchestrator {
     private eodUnwindCompleted = false;
     private lastTradingDay = '';
 
+    // Pool APR cache (refresh every 5 minutes)
+    private cachedPoolApr = 0;
+    private cachedPoolTvl = 0;
+    private lastAprFetch = 0;
+
     constructor() {
         this.pythClient = new PythClient();
         this.dataCollector = getDataCollector();
@@ -123,6 +128,37 @@ export class Orchestrator {
     private getCurrentET(): string {
         const now = new Date();
         return now.toLocaleString('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: true });
+    }
+
+    /**
+     * Fetch pool APR from Raydium API (caches for 5 minutes).
+     */
+    private async fetchPoolApr(): Promise<void> {
+        const RAYDIUM_API = 'https://api-v3.raydium.io';
+        const POOL_ID = config.RAYDIUM_POOL_ADDRESS.toBase58();
+
+        try {
+            const response = await fetch(`${RAYDIUM_API}/pools/info/ids?ids=${POOL_ID}`);
+            const json = await response.json() as { success: boolean; data: any[] };
+
+            if (json.success && json.data?.[0]) {
+                const pool = json.data[0];
+                this.cachedPoolApr = pool.day?.feeApr || pool.week?.feeApr || 0;
+                this.cachedPoolTvl = pool.tvl || 0;
+                this.lastAprFetch = Date.now();
+
+                log.debug({
+                    event: 'pool_apr_fetched',
+                    apr: this.cachedPoolApr,
+                    tvl: this.cachedPoolTvl,
+                });
+            }
+        } catch (error) {
+            log.warn({
+                event: 'pool_apr_fetch_error',
+                error: error instanceof Error ? error.message : String(error),
+            });
+        }
     }
 
     /**
@@ -491,6 +527,11 @@ export class Orchestrator {
         }
 
         // 7. Record cycle data for analysis
+        // Fetch pool APR if stale (every 5 minutes)
+        if (Date.now() - this.lastAprFetch > 300_000) {
+            await this.fetchPoolApr();
+        }
+
         this.dataCollector.recordCycle({
             timestamp: Date.now(),
             tslaPrice,
@@ -498,8 +539,8 @@ export class Orchestrator {
             hedgeDelta,
             netDelta: decision.currentDelta,
             isLpInRange,
-            poolApr: 0, // TODO: Fetch from Raydium API periodically
-            poolTvl: 0,
+            poolApr: this.cachedPoolApr,
+            poolTvl: this.cachedPoolTvl,
             rebalanceTriggered: decision.shouldRebalance && !decision.blocked,
             rebalanceReason: decision.reason,
             rebalanceSizeUsd: decision.sizeToAdjust,

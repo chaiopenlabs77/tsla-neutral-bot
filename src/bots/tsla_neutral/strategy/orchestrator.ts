@@ -566,6 +566,16 @@ export class Orchestrator {
             return false;
         }
 
+        // Ensure we have enough SOL for transaction fees before attempting any swaps
+        if (this.jupiterClient) {
+            const hasSol = await this.jupiterClient.ensureSolBalance();
+            if (!hasSol) {
+                log.warn({ event: 'rebalance_blocked', reason: 'insufficient_sol_for_fees' });
+                alertWarning('REBALANCE_BLOCKED', 'Could not ensure SOL balance for transaction fees');
+                return false;
+            }
+        }
+
         const absSize = Math.abs(sizeToAdjust);
 
         // Skip tiny adjustments

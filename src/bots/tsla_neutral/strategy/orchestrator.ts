@@ -430,7 +430,7 @@ export class Orchestrator {
         // ===== LIVE MODE: Fetch real on-chain data =====
 
         // 0. Proactively ensure SOL balance for gas (tops up early so swaps never fail)
-        if (this.jupiterClient && this.cycleCount % 10 === 0) { // Check every 10th cycle (~100s)
+        if (this.jupiterClient) {
             await this.jupiterClient.ensureSolBalance();
         }
 

@@ -56,26 +56,22 @@ export class Orchestrator {
     }
 
     /**
-     * Check if current time is within trading hours (9:15 AM - 3:45 PM ET).
+     * Check if Flash Trade hedge operations are available.
+     * Flash Trade TSLAr is 24/5 — open all day on weekdays, closed weekends + US bank holidays.
+     * (Holiday detection not implemented — failed trades are retried gracefully.)
      */
     private isWithinTradingHours(): boolean {
         const now = new Date();
-        // Convert to ET (handle DST automatically)
         const et = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
-        const hour = et.getHours();
-        const minute = et.getMinutes();
-        const currentMinutes = hour * 60 + minute;
 
-        const openMinutes = config.MARKET_OPEN_HOUR_ET * 60 + config.MARKET_OPEN_MINUTE_ET;
-        const closeMinutes = config.MARKET_CLOSE_HOUR_ET * 60 + config.MARKET_CLOSE_MINUTE_ET;
-
-        // Check if weekend
+        // Flash Trade is closed on weekends
         const dayOfWeek = et.getDay();
         if (dayOfWeek === 0 || dayOfWeek === 6) {
             return false;
         }
 
-        return currentMinutes >= openMinutes && currentMinutes <= closeMinutes;
+        // Open 24 hours on weekdays (Flash Trade is 24/5)
+        return true;
     }
 
     /**

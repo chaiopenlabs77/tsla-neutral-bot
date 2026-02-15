@@ -330,33 +330,35 @@ export class JupiterClient {
    * @param topUpLamports - Amount to top up if below minimum (default: 0.1 SOL)
    * @returns True if balance is sufficient or top-up succeeded
    */
-  async ensureSolBalance(
-    minSolLamports: bigint = 50_000_000n, // 0.05 SOL — high enough that the USDC→SOL swap itself has gas headroom
-    topUpLamports: bigint = 100_000_000n // 0.1 SOL (~$13.50) — top up generously to avoid frequent swaps
-  ): Promise<boolean> {
+  async ensureSolBalance(): Promise<boolean> {
     this.ensureInitialized();
 
+    const minSol = config.GAS_TOP_UP_THRESHOLD_SOL;
+    const minSolLamports = BigInt(Math.floor(minSol * 1e9));
     const solBalance = await this.connection.getBalance(this.wallet!.publicKey);
 
     if (BigInt(solBalance) >= minSolLamports) {
       log.info({
         event: 'sol_balance_sufficient',
         balance: (solBalance / 1e9).toFixed(4),
-        minRequired: (Number(minSolLamports) / 1e9).toFixed(4),
+        minRequired: minSol.toFixed(4),
       });
       return true;
     }
 
-    // Need to top up - calculate USDC needed
-    // Get SOL price in USDC (approx $200/SOL)
+    // Only buy the deficit + 10% buffer
+    const deficit = Number(minSolLamports) - solBalance;
+    const topUpLamports = Math.ceil(deficit * 1.10);
+
     const solPrice = await this.getPrice(TOKEN_MINTS.SOL, TOKEN_MINTS.USDC);
-    const usdcNeeded = Math.ceil((Number(topUpLamports) / 1e9) * solPrice * 1e6); // In USDC micros
+    const usdcNeeded = Math.ceil((topUpLamports / 1e9) * solPrice * 1e6);
 
     log.info({
       event: 'sol_top_up_required',
       currentBalance: (solBalance / 1e9).toFixed(4),
-      minRequired: (Number(minSolLamports) / 1e9).toFixed(4),
-      topUpAmount: (Number(topUpLamports) / 1e9).toFixed(4),
+      minRequired: minSol.toFixed(4),
+      deficitSol: (deficit / 1e9).toFixed(4),
+      topUpSol: (topUpLamports / 1e9).toFixed(4),
       usdcNeeded: (usdcNeeded / 1e6).toFixed(2),
     });
 

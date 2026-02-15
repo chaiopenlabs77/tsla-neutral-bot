@@ -28,6 +28,10 @@ export interface CycleData {
     rebalanceReason: string | null;
     rebalanceSizeUsd: number;
     gasCostUsd: number;
+    // Phase 3: Cost tracking fields (nullable for backward compatibility)
+    estFundingCostUsd?: number;
+    rebalanceSlippageCostUsd?: number;
+    repositionEvent?: boolean;
 }
 
 // ============================================================================
@@ -76,6 +80,19 @@ export class DataCollector {
                 CREATE INDEX IF NOT EXISTS idx_cycles_rebalance ON cycles(rebalance_triggered);
             `);
 
+            // Migration: add cost tracking columns if they don't exist
+            const columns = this.db.pragma('table_info(cycles)') as { name: string }[];
+            const colNames = new Set(columns.map(c => c.name));
+            if (!colNames.has('est_funding_cost_usd')) {
+                this.db.exec('ALTER TABLE cycles ADD COLUMN est_funding_cost_usd REAL DEFAULT 0');
+            }
+            if (!colNames.has('rebalance_slippage_cost_usd')) {
+                this.db.exec('ALTER TABLE cycles ADD COLUMN rebalance_slippage_cost_usd REAL DEFAULT 0');
+            }
+            if (!colNames.has('reposition_event')) {
+                this.db.exec('ALTER TABLE cycles ADD COLUMN reposition_event INTEGER DEFAULT 0');
+            }
+
             log.info({ event: 'data_collector_initialized', dbPath: this.dbPath });
         } catch (error) {
             log.error({
@@ -97,8 +114,9 @@ export class DataCollector {
                 INSERT INTO cycles (
                     timestamp, tsla_price, lp_delta, hedge_delta, net_delta,
                     is_lp_in_range, pool_apr, pool_tvl, rebalance_triggered,
-                    rebalance_reason, rebalance_size_usd, gas_cost_usd
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    rebalance_reason, rebalance_size_usd, gas_cost_usd,
+                    est_funding_cost_usd, rebalance_slippage_cost_usd, reposition_event
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             `);
 
             stmt.run(
@@ -113,7 +131,10 @@ export class DataCollector {
                 data.rebalanceTriggered ? 1 : 0,
                 data.rebalanceReason,
                 data.rebalanceSizeUsd,
-                data.gasCostUsd
+                data.gasCostUsd,
+                data.estFundingCostUsd || 0,
+                data.rebalanceSlippageCostUsd || 0,
+                data.repositionEvent ? 1 : 0
             );
 
             log.debug({ event: 'cycle_recorded', timestamp: data.timestamp });

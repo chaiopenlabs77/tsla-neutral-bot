@@ -49,6 +49,9 @@ export class Orchestrator {
     private cachedPoolTvl = 0;
     private lastAprFetch = 0;
 
+    // Price history for stabilization check (rolling buffer)
+    private priceHistory: { ts: number; price: number }[] = [];
+
     constructor() {
         this.pythClient = new PythClient();
         this.dataCollector = getDataCollector();
@@ -447,6 +450,16 @@ export class Orchestrator {
             log.warn({ event: 'pyth_fetch_error', error: error instanceof Error ? error.message : String(error) });
         }
 
+        // Track price history for stabilization checks (keep last 2 minutes)
+        if (tslaPrice > 0) {
+            const now = Date.now();
+            this.priceHistory.push({ ts: now, price: tslaPrice });
+            const cutoff = now - 120_000; // 2 minutes
+            while (this.priceHistory.length > 0 && this.priceHistory[0].ts < cutoff) {
+                this.priceHistory.shift();
+            }
+        }
+
         // 2. Fetch LP positions and calculate delta
         let lpDelta = 0;
         let isLpInRange = true;
@@ -556,8 +569,13 @@ export class Orchestrator {
                 let success: boolean;
 
                 if (decision.reason === 'out_of_range_too_long') {
-                    // LP is out of range — reposition it instead of just adjusting hedge
-                    success = await this.repositionLP(tslaPrice);
+                    // LP is out of range — reposition, but only if price has stabilized
+                    if (!this.isPriceStable()) {
+                        log.info({ event: 'reposition_deferred', reason: 'price_unstable' });
+                        success = false; // Don't count as failure — just wait
+                    } else {
+                        success = await this.repositionLP(tslaPrice);
+                    }
                 } else {
                     // Normal delta drift — adjust hedge
                     success = await this.executeRebalance(decision.sizeToAdjust, tslaPrice, hedgePositions);
@@ -578,6 +596,22 @@ export class Orchestrator {
         // Fetch pool APR if stale (every 5 minutes)
         if (Date.now() - this.lastAprFetch > 300_000) {
             await this.fetchPoolApr();
+        }
+
+        // Estimated daily funding cost (hedge notional × daily rate)
+        const hedgeNotional = Math.abs(hedgeDelta);
+        const estDailyFundingUsd = hedgeNotional * config.FUNDING_RATE_SPIKE_THRESHOLD;
+        if (estDailyFundingUsd > 0 && this.cachedPoolApr > 0) {
+            // Warn if funding cost exceeds 50% of gross fee income
+            const grossDailyFees = (hedgeNotional * (this.cachedPoolApr / 100)) / 365;
+            if (estDailyFundingUsd > grossDailyFees * 0.5) {
+                log.warn({
+                    event: 'funding_cost_high',
+                    estDailyFundingUsd: estDailyFundingUsd.toFixed(2),
+                    grossDailyFees: grossDailyFees.toFixed(2),
+                    ratio: (estDailyFundingUsd / grossDailyFees).toFixed(2),
+                });
+            }
         }
 
         // Measure actual gas cost (SOL difference × rough price)
@@ -604,6 +638,8 @@ export class Orchestrator {
             rebalanceReason: decision.reason,
             rebalanceSizeUsd: decision.sizeToAdjust,
             gasCostUsd: actualGasCostUsd,
+            estFundingCostUsd: estDailyFundingUsd / (86400 / (config.LOOP_INTERVAL_MS / 1000)), // Per-cycle funding
+            repositionEvent: decision.reason === 'out_of_range_too_long' && decision.shouldRebalance,
         });
 
         this.state = await recordSuccess(this.state);
@@ -822,6 +858,24 @@ export class Orchestrator {
      * Reposition LP: close current out-of-range position and re-open at current price.
      * Does NOT touch the hedge — the next cycle's delta drift check will adjust it.
      */
+    /**
+     * Check if price has stabilized (low velocity over last 30s).
+     * Returns true if we have enough data and price change is < 0.5%.
+     */
+    private isPriceStable(): boolean {
+        if (this.priceHistory.length < 3) return false; // Need at least 3 observations
+
+        const now = Date.now();
+        const recent = this.priceHistory.filter(p => p.ts > now - 30_000);
+        if (recent.length < 2) return false;
+
+        const first = recent[0].price;
+        const last = recent[recent.length - 1].price;
+        const changePct = Math.abs(last - first) / first;
+
+        return changePct < 0.005; // < 0.5% move in last 30s
+    }
+
     private async repositionLP(currentPrice: number): Promise<boolean> {
         if (!this.lpClient || !this.jupiterClient) {
             log.error({ event: 'reposition_failed', error: 'Clients not initialized' });

@@ -256,6 +256,21 @@ export class JupiterClient {
     slippageBps?: number
   ): Promise<{ txSignature: string; tslaxAmount: string } | null> {
     const quote = await this.getQuote(TOKEN_MINTS.USDC, TOKEN_MINTS.TSLAX, usdcAmount, slippageBps);
+
+    // Check price impact before executing large swaps
+    const impactPct = parseFloat(quote.priceImpactPct || '0');
+    const swapUsd = Number(usdcAmount) / 1e6;
+    if (swapUsd > 1000 && Math.abs(impactPct) > config.EOD_SWAP_MAX_SLIPPAGE_PERCENT / 100) {
+      log.warn({
+        event: 'swap_blocked_price_impact',
+        direction: 'USDC→TSLAx',
+        swapUsd: swapUsd.toFixed(2),
+        priceImpactPct: impactPct,
+        maxAllowed: config.EOD_SWAP_MAX_SLIPPAGE_PERCENT / 100,
+      });
+      return null;
+    }
+
     const result = await this.swap(quote);
     if (result) {
       return { ...result, tslaxAmount: quote.outAmount };
@@ -271,6 +286,21 @@ export class JupiterClient {
     slippageBps?: number
   ): Promise<{ txSignature: string; usdcAmount: string } | null> {
     const quote = await this.getQuote(TOKEN_MINTS.TSLAX, TOKEN_MINTS.USDC, tslaxAmount, slippageBps);
+
+    // Check price impact before executing large swaps
+    const impactPct = parseFloat(quote.priceImpactPct || '0');
+    const swapUsd = Number(quote.outAmount) / 1e6; // Output is USDC
+    if (swapUsd > 1000 && Math.abs(impactPct) > config.EOD_SWAP_MAX_SLIPPAGE_PERCENT / 100) {
+      log.warn({
+        event: 'swap_blocked_price_impact',
+        direction: 'TSLAx→USDC',
+        swapUsd: swapUsd.toFixed(2),
+        priceImpactPct: impactPct,
+        maxAllowed: config.EOD_SWAP_MAX_SLIPPAGE_PERCENT / 100,
+      });
+      return null;
+    }
+
     const result = await this.swap(quote);
     if (result) {
       return { ...result, usdcAmount: quote.outAmount };

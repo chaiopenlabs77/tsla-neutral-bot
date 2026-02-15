@@ -393,6 +393,10 @@ export class LPClient {
                 const tokenAAmount = BigInt(amounts.amountA.toString());
                 const tokenBAmount = BigInt(amounts.amountB.toString());
 
+                // Extract uncollected fee amounts from position data
+                const tokenFeesOwedA = BigInt(pos.tokenFeesOwedA?.toString() || '0');
+                const tokenFeesOwedB = BigInt(pos.tokenFeesOwedB?.toString() || '0');
+
                 log.debug({
                     event: 'calculated_position_amounts',
                     tickLower: pos.tickLower,
@@ -400,6 +404,8 @@ export class LPClient {
                     liquidity: liquidity.toString(),
                     tokenAAmount: tokenAAmount.toString(),
                     tokenBAmount: tokenBAmount.toString(),
+                    tokenFeesOwedA: tokenFeesOwedA.toString(),
+                    tokenFeesOwedB: tokenFeesOwedB.toString(),
                 });
 
                 return {
@@ -412,6 +418,8 @@ export class LPClient {
                     tokenBAmount,
                     inRange: this.isPositionInRange(pos.tickLower, pos.tickUpper),
                     entryPrice: this.getCurrentPrice(),
+                    tokenFeesOwedA,
+                    tokenFeesOwedB,
                 };
             });
 

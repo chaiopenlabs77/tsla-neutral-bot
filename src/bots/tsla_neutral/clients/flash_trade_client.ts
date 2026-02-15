@@ -548,6 +548,18 @@ export class FlashTradeClient {
                     computedDelta: side === 'SHORT' ? -size : size,
                 });
 
+                // Extract funding/fee fields from raw position data
+                const unsettledFeesUsd = Number(data.unsettledFeesUsd || 0) / 1e6;
+                const cumulativeLockFeeSnapshot = Number(data.cumulativeLockFeeSnapshot || 0) / 1e9;
+
+                log.debug({
+                    event: 'flash_funding_fields',
+                    unsettledFeesUsd,
+                    cumulativeLockFeeSnapshot,
+                    rawUnsettledFees: data.unsettledFeesUsd?.toString(),
+                    rawCumulativeLockFee: data.cumulativeLockFeeSnapshot?.toString(),
+                });
+
                 return {
                     positionId: pos.publicKey.toBase58(),
                     market: this.targetSymbol,
@@ -558,6 +570,8 @@ export class FlashTradeClient {
                     liquidationPrice: 0, // Calculate from metrics
                     unrealizedPnl: 0,
                     marginUsed: Number(data.collateralAmount || 0) / 1e6,
+                    unsettledFeesUsd,
+                    cumulativeLockFeeSnapshot,
                 };
             });
 

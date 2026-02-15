@@ -32,6 +32,11 @@ export interface CycleData {
     estFundingCostUsd?: number;
     rebalanceSlippageCostUsd?: number;
     repositionEvent?: boolean;
+    // Phase 4: Actual tracking fields
+    lpFeesUsd?: number;           // Uncollected LP fees (tokenFeesOwedA * price + tokenFeesOwedB) in USD
+    lpValueUsd?: number;          // Total LP position value (tokenA * price + tokenB) in USD
+    hedgeFundingUsd?: number;     // Flash Trade unsettledFeesUsd (actual funding paid/received)
+    hedgeCumLockFee?: number;     // Flash Trade cumulativeLockFeeSnapshot
 }
 
 // ============================================================================
@@ -92,6 +97,18 @@ export class DataCollector {
             if (!colNames.has('reposition_event')) {
                 this.db.exec('ALTER TABLE cycles ADD COLUMN reposition_event INTEGER DEFAULT 0');
             }
+            if (!colNames.has('lp_fees_usd')) {
+                this.db.exec('ALTER TABLE cycles ADD COLUMN lp_fees_usd REAL DEFAULT 0');
+            }
+            if (!colNames.has('lp_value_usd')) {
+                this.db.exec('ALTER TABLE cycles ADD COLUMN lp_value_usd REAL DEFAULT 0');
+            }
+            if (!colNames.has('hedge_funding_usd')) {
+                this.db.exec('ALTER TABLE cycles ADD COLUMN hedge_funding_usd REAL DEFAULT 0');
+            }
+            if (!colNames.has('hedge_cum_lock_fee')) {
+                this.db.exec('ALTER TABLE cycles ADD COLUMN hedge_cum_lock_fee REAL DEFAULT 0');
+            }
 
             log.info({ event: 'data_collector_initialized', dbPath: this.dbPath });
         } catch (error) {
@@ -115,8 +132,9 @@ export class DataCollector {
                     timestamp, tsla_price, lp_delta, hedge_delta, net_delta,
                     is_lp_in_range, pool_apr, pool_tvl, rebalance_triggered,
                     rebalance_reason, rebalance_size_usd, gas_cost_usd,
-                    est_funding_cost_usd, rebalance_slippage_cost_usd, reposition_event
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    est_funding_cost_usd, rebalance_slippage_cost_usd, reposition_event,
+                    lp_fees_usd, lp_value_usd, hedge_funding_usd, hedge_cum_lock_fee
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             `);
 
             stmt.run(
@@ -134,7 +152,11 @@ export class DataCollector {
                 data.gasCostUsd,
                 data.estFundingCostUsd || 0,
                 data.rebalanceSlippageCostUsd || 0,
-                data.repositionEvent ? 1 : 0
+                data.repositionEvent ? 1 : 0,
+                data.lpFeesUsd || 0,
+                data.lpValueUsd || 0,
+                data.hedgeFundingUsd || 0,
+                data.hedgeCumLockFee || 0
             );
 
             log.debug({ event: 'cycle_recorded', timestamp: data.timestamp });

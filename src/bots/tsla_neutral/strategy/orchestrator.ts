@@ -1,5 +1,5 @@
 import { config } from '../config';
-import { BotState, StateMachineState, CycleMetrics, HedgePosition } from '../types';
+import { BotState, StateMachineState, CycleMetrics, HedgePosition, LPPosition } from '../types';
 import {
     loadState,
     transitionState,
@@ -295,9 +295,10 @@ export class Orchestrator {
         let lpDelta = 0;
         let isLpInRange = true;
         let lpPositionCount = 0;
+        let lpPositions: LPPosition[] = [];
         if (this.lpClient) {
             try {
-                const lpPositions = await this.lpClient.fetchPositions();
+                lpPositions = await this.lpClient.fetchPositions();
                 lpPositionCount = lpPositions.length;
                 for (const pos of lpPositions) {
                     lpDelta += this.lpClient.calculatePositionDelta(pos, tslaPrice || 400);
@@ -464,6 +465,33 @@ export class Orchestrator {
             }
         } catch { /* non-critical */ }
 
+        // Compute LP fees and value from position data
+        let lpFeesUsd = 0;
+        let lpValueUsd = 0;
+        if (lpPositions.length > 0) {
+            for (const pos of lpPositions) {
+                // LP fees: tokenFeesOwedA (TSLAx, 8 decimals) * price + tokenFeesOwedB (USDC, 6 decimals)
+                const feesA = Number(pos.tokenFeesOwedA) / 1e8;
+                const feesB = Number(pos.tokenFeesOwedB) / 1e6;
+                lpFeesUsd += feesA * tslaPrice + feesB;
+
+                // LP value: tokenA (TSLAx) * price + tokenB (USDC)
+                const tokenA = Number(pos.tokenAAmount) / 1e8;
+                const tokenB = Number(pos.tokenBAmount) / 1e6;
+                lpValueUsd += tokenA * tslaPrice + tokenB;
+            }
+        }
+
+        // Compute hedge funding fields
+        let hedgeFundingUsd = 0;
+        let hedgeCumLockFee = 0;
+        if (hedgePositions.length > 0) {
+            for (const pos of hedgePositions) {
+                hedgeFundingUsd += pos.unsettledFeesUsd;
+                hedgeCumLockFee += pos.cumulativeLockFeeSnapshot;
+            }
+        }
+
         this.dataCollector.recordCycle({
             timestamp: Date.now(),
             tslaPrice,
@@ -479,6 +507,10 @@ export class Orchestrator {
             gasCostUsd: actualGasCostUsd,
             estFundingCostUsd: estDailyFundingUsd / (86400 / (config.LOOP_INTERVAL_MS / 1000)), // Per-cycle funding
             repositionEvent: decision.reason === 'out_of_range_too_long' && decision.shouldRebalance,
+            lpFeesUsd,
+            lpValueUsd,
+            hedgeFundingUsd,
+            hedgeCumLockFee,
         });
 
         this.state = await recordSuccess(this.state);

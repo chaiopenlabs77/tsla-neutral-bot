@@ -39,6 +39,8 @@ export interface LPPosition {
     tokenBAmount: bigint;
     inRange: boolean;
     entryPrice: number;
+    tokenFeesOwedA: bigint;
+    tokenFeesOwedB: bigint;
 }
 
 export interface HedgePosition {
@@ -51,6 +53,8 @@ export interface HedgePosition {
     liquidationPrice: number;
     unrealizedPnl: number;
     marginUsed: number;
+    unsettledFeesUsd: number;
+    cumulativeLockFeeSnapshot: number;
 }
 
 // ============================================================================

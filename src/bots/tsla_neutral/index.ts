@@ -7,9 +7,19 @@ import { startMetricsServer, stopMetricsServer } from './observability/metrics';
 import { logger } from './observability/logger';
 import { alerts, alertCritical } from './observability/alerter';
 import { Orchestrator } from './strategy/orchestrator';
+import { execSync } from 'child_process';
+
+function getGitCommit(): string {
+    try {
+        return execSync('git rev-parse --short HEAD', { encoding: 'utf-8' }).trim();
+    } catch {
+        return 'unknown';
+    }
+}
 
 async function main(): Promise<void> {
-    logger.info({ event: 'startup', dryRun: config.DRY_RUN });
+    const commit = getGitCommit();
+    logger.info({ event: 'startup', dryRun: config.DRY_RUN, commit, rangeWidth: config.RANGE_WIDTH_PERCENT });
 
     // Install signal handlers first
     installSignalHandlers();

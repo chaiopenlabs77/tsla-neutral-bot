@@ -40,9 +40,7 @@ export class Orchestrator {
     private hasBootstrapped = false;
     private dataCollector: DataCollector;
 
-    // EOD tracking
-    private eodUnwindCompleted = false;
-    private lastTradingDay = '';
+    // (EOD unwind removed — LP + hedge stay open 24/7)
 
     // Pool APR cache (refresh every 5 minutes)
     private cachedPoolApr = 0;
@@ -83,48 +81,6 @@ export class Orchestrator {
     /**
      * Check if it's time to open positions (at market open time).
      */
-    private shouldOpenPosition(): boolean {
-        const now = new Date();
-        const et = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
-        const hour = et.getHours();
-        const minute = et.getMinutes();
-
-        // Check if it's market open time (within first 5 minutes of trading window)
-        const openHour = config.MARKET_OPEN_HOUR_ET;
-        const openMinute = config.MARKET_OPEN_MINUTE_ET;
-
-        return hour === openHour && minute >= openMinute && minute <= openMinute + 5;
-    }
-
-    /**
-     * Check if it's time to unwind (at market close time).
-     */
-    private shouldUnwind(): boolean {
-        const now = new Date();
-        const et = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
-        const today = et.toISOString().split('T')[0];
-
-        // Reset flag for new day
-        if (this.lastTradingDay !== today) {
-            this.lastTradingDay = today;
-            this.eodUnwindCompleted = false;
-        }
-
-        // Already unwound today
-        if (this.eodUnwindCompleted) {
-            return false;
-        }
-
-        const hour = et.getHours();
-        const minute = et.getMinutes();
-
-        // Check if it's within 5 minutes of close time (3:45-3:50 PM)
-        const closeHour = config.MARKET_CLOSE_HOUR_ET;
-        const closeMinute = config.MARKET_CLOSE_MINUTE_ET;
-
-        return hour === closeHour && minute >= closeMinute && minute <= closeMinute + 5;
-    }
-
     /**
      * Get current ET time string for logging.
      */
@@ -162,115 +118,6 @@ export class Orchestrator {
                 error: error instanceof Error ? error.message : String(error),
             });
         }
-    }
-
-    /**
-     * Perform End-of-Day unwind: close all positions and swap TSLAx to USDC.
-     */
-    private async performEodUnwind(): Promise<void> {
-        log.info({ event: 'eod_unwind_starting', et: this.getCurrentET() });
-
-        // Get current price for slippage calculations
-        let currentPrice = 0;
-        try {
-            const priceData = await this.pythClient.getTSLAPrice();
-            if (priceData) {
-                currentPrice = priceData.price;
-            }
-        } catch (error) {
-            log.warn({ event: 'pyth_price_error_eod', error: String(error) });
-        }
-
-        // 1. Close Flash Trade hedge positions
-        if (this.flashTradeClient) {
-            try {
-                log.info({ event: 'eod_closing_flash_trade' });
-                const result = await this.flashTradeClient.closePosition(config.MAX_SLIPPAGE_BPS, currentPrice || undefined);
-                if (result) {
-                    log.info({ event: 'flash_trade_closed', tx: result.txSignature });
-                }
-            } catch (error) {
-                log.error({ event: 'flash_trade_close_error', error: String(error) });
-            }
-        }
-
-        // 2. Close LP positions
-        if (this.lpClient) {
-            try {
-                log.info({ event: 'eod_closing_lp_positions' });
-                const positions = await this.lpClient.fetchPositions();
-                for (const pos of positions) {
-                    // LPPosition.mint is the NFT mint for the position
-                    const result = await this.lpClient.closePosition(pos.mint);
-                    if (result) {
-                        log.info({ event: 'lp_position_closed', tx: result.txSignature });
-                    }
-                }
-            } catch (error) {
-                log.error({ event: 'lp_close_error', error: String(error) });
-            }
-        }
-
-        // 3. Swap any remaining TSLAx to USDC with retry
-        if (this.jupiterClient && this.wallet) {
-            try {
-                // Get TSLAx balance via SPL token balance check
-                const tslaxMint = new PublicKey(TOKEN_MINTS.TSLAX);
-                const tokenAccounts = await this.jupiterClient['connection'].getTokenAccountsByOwner(
-                    this.wallet.publicKey,
-                    { mint: tslaxMint }
-                );
-
-                let tslaxBalance = 0n;
-                if (tokenAccounts.value.length > 0) {
-                    const accountInfo = tokenAccounts.value[0];
-                    const data = accountInfo.account.data;
-                    // SPL token amount is at offset 64, 8 bytes
-                    tslaxBalance = data.readBigUInt64LE(64);
-                }
-
-                if (tslaxBalance > 1000n) { // Only swap if significant (> 0.001 TSLAx)
-                    log.info({ event: 'eod_swapping_tslax', balance: Number(tslaxBalance) / 1e6 });
-
-                    // Retry with escalating slippage: 50 -> 100 -> 200 bps (capped — 500bps loses too much)
-                    // If all fail, hold TSLAx overnight (hedged position = minimal overnight risk)
-                    const slippageLevels = [50, 100, 200];
-                    let swapSuccess = false;
-
-                    for (const slippageBps of slippageLevels) {
-                        try {
-                            log.info({ event: 'eod_swap_attempt', slippageBps });
-                            const result = await this.jupiterClient.swapTslaxToUsdc(tslaxBalance, slippageBps);
-                            if (result) {
-                                log.info({ event: 'tslax_swapped', tx: result.txSignature, slippageBps });
-                                swapSuccess = true;
-                                break;
-                            }
-                        } catch (swapError) {
-                            log.warn({
-                                event: 'eod_swap_retry',
-                                slippageBps,
-                                error: swapError instanceof Error ? swapError.message : String(swapError)
-                            });
-                            // Wait 2 seconds before retry with higher slippage
-                            await sleep(2000);
-                        }
-                    }
-
-                    if (!swapSuccess) {
-                        log.warn({ event: 'eod_swap_holding_overnight', balance: Number(tslaxBalance) / 1e6 });
-                        alertWarning('EOD_SWAP_HELD', `Holding ${(Number(tslaxBalance) / 1e6).toFixed(2)} TSLAx overnight (hedged) — slippage too high`);
-                    }
-                }
-            } catch (error) {
-                log.error({ event: 'tslax_swap_error', error: String(error) });
-            }
-        }
-
-        // Reset bootstrap flag for next day
-        this.hasBootstrapped = false;
-
-        log.info({ event: 'eod_unwind_complete' });
     }
 
     /**
@@ -409,21 +256,9 @@ export class Orchestrator {
         log.debug({ event: 'cycle_start', cycle: this.cycleCount, et: this.getCurrentET() });
 
         // ===== MARKET HOURS CHECK =====
+        // LP runs 24/7; only hedge operations (open/rebalance) are gated on market hours.
+        // Both LP and hedge stay open continuously — no daily EOD unwind.
         const withinHours = this.isWithinTradingHours();
-
-        // Check if it's time for EOD unwind
-        if (this.shouldUnwind()) {
-            log.info({ event: 'eod_unwind_triggered', et: this.getCurrentET() });
-            await this.performEodUnwind();
-            this.eodUnwindCompleted = true;
-            return;
-        }
-
-        // Outside trading hours - just monitor
-        if (!withinHours) {
-            log.debug({ event: 'outside_trading_hours', et: this.getCurrentET(), nextOpen: `${config.MARKET_OPEN_HOUR_ET}:${config.MARKET_OPEN_MINUTE_ET}` });
-            return;
-        }
 
         // In DRY_RUN mode, just log what we would do
         if (config.DRY_RUN) {
@@ -489,12 +324,16 @@ export class Orchestrator {
                     }
                 }
 
-                // Bootstrap: Create initial LP position if none exists
-                // BUT NOT during EOD unwind window (3:45-3:50 PM ET)
-                if (lpPositionCount === 0 && config.AUTO_BOOTSTRAP && !this.hasBootstrapped && !this.shouldUnwind()) {
-                    log.info({ event: 'bootstrap_check', noPositions: true, autoBootstrap: true });
-                    await this.bootstrapPosition(tslaPrice);
-                    return; // Wait for next cycle to process the new position
+                // Bootstrap: Create initial LP + hedge if none exists
+                // Requires market hours since hedge (Flash Trade) can't open on weekends
+                if (lpPositionCount === 0 && config.AUTO_BOOTSTRAP && !this.hasBootstrapped) {
+                    if (!withinHours) {
+                        log.debug({ event: 'bootstrap_deferred', reason: 'outside_market_hours', et: this.getCurrentET() });
+                    } else {
+                        log.info({ event: 'bootstrap_check', noPositions: true, autoBootstrap: true });
+                        await this.bootstrapPosition(tslaPrice);
+                        return; // Wait for next cycle to process the new position
+                    }
                 }
             } catch (error) {
                 log.warn({ event: 'lp_fetch_error', error: error instanceof Error ? error.message : String(error) });
@@ -569,15 +408,19 @@ export class Orchestrator {
                 let success: boolean;
 
                 if (decision.reason === 'out_of_range_too_long') {
-                    // LP is out of range — reposition, but only if price has stabilized
+                    // LP is out of range — reposition anytime (LP runs 24/7)
                     if (!this.isPriceStable()) {
                         log.info({ event: 'reposition_deferred', reason: 'price_unstable' });
                         success = false; // Don't count as failure — just wait
                     } else {
                         success = await this.repositionLP(tslaPrice);
                     }
+                } else if (!withinHours) {
+                    // Hedge rebalance only during market hours (Flash Trade restriction)
+                    log.debug({ event: 'hedge_rebalance_deferred', reason: 'outside_market_hours', et: this.getCurrentET() });
+                    success = false;
                 } else {
-                    // Normal delta drift — adjust hedge
+                    // Normal delta drift — adjust hedge (market hours only)
                     success = await this.executeRebalance(decision.sizeToAdjust, tslaPrice, hedgePositions);
                 }
 

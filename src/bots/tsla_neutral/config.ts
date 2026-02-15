@@ -95,6 +95,7 @@ export const config = {
     PYTH_CONFIDENCE_THRESHOLD_PERCENT: optionalEnvNumber('PYTH_CONFIDENCE_THRESHOLD_PERCENT', 0.01), // 1%
     MAX_OUT_OF_RANGE_DURATION_MS: optionalEnvNumber('MAX_OUT_OF_RANGE_DURATION_MS', 3600000), // 1 hour
     MAX_GAS_COST_PER_REBALANCE_SOL: optionalEnvNumber('MAX_GAS_COST_PER_REBALANCE_SOL', 0.05),
+    MIN_REBALANCE_INTERVAL_MS: optionalEnvNumber('MIN_REBALANCE_INTERVAL_MS', 300000), // 5 min cooldown
 
     // ──────────────────────────────────────────────────────────────────────────
     // Risk Management

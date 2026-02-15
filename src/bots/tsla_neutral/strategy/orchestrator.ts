@@ -229,8 +229,9 @@ export class Orchestrator {
                 if (tslaxBalance > 1000n) { // Only swap if significant (> 0.001 TSLAx)
                     log.info({ event: 'eod_swapping_tslax', balance: Number(tslaxBalance) / 1e6 });
 
-                    // Retry with escalating slippage: 50 -> 100 -> 200 -> 500 bps
-                    const slippageLevels = [50, 100, 200, 500];
+                    // Retry with escalating slippage: 50 -> 100 -> 200 bps (capped — 500bps loses too much)
+                    // If all fail, hold TSLAx overnight (hedged position = minimal overnight risk)
+                    const slippageLevels = [50, 100, 200];
                     let swapSuccess = false;
 
                     for (const slippageBps of slippageLevels) {
@@ -254,8 +255,8 @@ export class Orchestrator {
                     }
 
                     if (!swapSuccess) {
-                        log.error({ event: 'eod_swap_all_retries_failed', balance: Number(tslaxBalance) / 1e6 });
-                        alertWarning('EOD_SWAP_FAILED', `Failed to swap ${(Number(tslaxBalance) / 1e6).toFixed(2)} TSLAx after 4 attempts`);
+                        log.warn({ event: 'eod_swap_holding_overnight', balance: Number(tslaxBalance) / 1e6 });
+                        alertWarning('EOD_SWAP_HELD', `Holding ${(Number(tslaxBalance) / 1e6).toFixed(2)} TSLAx overnight (hedged) — slippage too high`);
                     }
                 }
             } catch (error) {
@@ -460,6 +461,21 @@ export class Orchestrator {
                 }
                 log.debug({ event: 'lp_positions_fetched', count: lpPositions.length, totalDelta: lpDelta });
 
+                // Track out-of-range duration for LP repositioning
+                if (lpPositionCount > 0) {
+                    if (!isLpInRange && !this.state!.outOfRangeSince) {
+                        this.state = await transitionState(this.state!, this.state!.currentState, {
+                            outOfRangeSince: Date.now(),
+                        });
+                        log.info({ event: 'lp_out_of_range_started', price: tslaPrice });
+                    } else if (isLpInRange && this.state!.outOfRangeSince) {
+                        this.state = await transitionState(this.state!, this.state!.currentState, {
+                            outOfRangeSince: null,
+                        });
+                        log.info({ event: 'lp_back_in_range', price: tslaPrice });
+                    }
+                }
+
                 // Bootstrap: Create initial LP position if none exists
                 // BUT NOT during EOD unwind window (3:45-3:50 PM ET)
                 if (lpPositionCount === 0 && config.AUTO_BOOTSTRAP && !this.hasBootstrapped && !this.shouldUnwind()) {
@@ -487,8 +503,15 @@ export class Orchestrator {
             }
         }
 
-        // 4. Evaluate rebalance decision
-        const estimatedGasCost = 0.001; // ~0.001 SOL for tx
+        // 4. Snapshot SOL balance before rebalance (to measure real gas cost)
+        let solBalanceBefore = 0;
+        try {
+            const connection = getRpcManager().getConnection();
+            solBalanceBefore = await connection.getBalance(this.wallet!.publicKey);
+        } catch { /* non-critical */ }
+
+        // Evaluate rebalance decision
+        const estimatedGasCost = 0.001; // ~0.001 SOL estimate for risk manager check
         const decision = evaluateRebalance(
             this.state,
             lpDelta,
@@ -512,22 +535,42 @@ export class Orchestrator {
 
         // 6. Handle rebalance decision
         if (decision.shouldRebalance && !decision.blocked) {
-            log.info({
-                event: 'rebalance_triggered',
-                reason: decision.reason,
-                currentDelta: decision.currentDelta,
-                sizeToAdjust: decision.sizeToAdjust,
-            });
-
-            rebalanceCounter.inc({ reason: decision.reason, status: 'pending' });
-
-            // Execute the rebalance
-            const success = await this.executeRebalance(decision.sizeToAdjust, tslaPrice, hedgePositions);
-
-            if (success) {
-                rebalanceCounter.inc({ reason: decision.reason, status: 'success' });
+            // Cooldown: skip if we rebalanced too recently
+            const timeSinceLastRebalance = Date.now() - (this.state!.lastRebalanceTime || 0);
+            if (timeSinceLastRebalance < config.MIN_REBALANCE_INTERVAL_MS) {
+                log.info({
+                    event: 'rebalance_cooldown',
+                    msSinceLastRebalance: timeSinceLastRebalance,
+                    cooldownMs: config.MIN_REBALANCE_INTERVAL_MS,
+                });
             } else {
-                rebalanceCounter.inc({ reason: decision.reason, status: 'failure' });
+                log.info({
+                    event: 'rebalance_triggered',
+                    reason: decision.reason,
+                    currentDelta: decision.currentDelta,
+                    sizeToAdjust: decision.sizeToAdjust,
+                });
+
+                rebalanceCounter.inc({ reason: decision.reason, status: 'pending' });
+
+                let success: boolean;
+
+                if (decision.reason === 'out_of_range_too_long') {
+                    // LP is out of range — reposition it instead of just adjusting hedge
+                    success = await this.repositionLP(tslaPrice);
+                } else {
+                    // Normal delta drift — adjust hedge
+                    success = await this.executeRebalance(decision.sizeToAdjust, tslaPrice, hedgePositions);
+                }
+
+                if (success) {
+                    rebalanceCounter.inc({ reason: decision.reason, status: 'success' });
+                    this.state = await transitionState(this.state!, this.state!.currentState, {
+                        lastRebalanceTime: Date.now(),
+                    });
+                } else {
+                    rebalanceCounter.inc({ reason: decision.reason, status: 'failure' });
+                }
             }
         }
 
@@ -536,6 +579,17 @@ export class Orchestrator {
         if (Date.now() - this.lastAprFetch > 300_000) {
             await this.fetchPoolApr();
         }
+
+        // Measure actual gas cost (SOL difference × rough price)
+        let actualGasCostUsd = 0;
+        try {
+            const connection = getRpcManager().getConnection();
+            const solBalanceAfter = await connection.getBalance(this.wallet!.publicKey);
+            const solSpent = (solBalanceBefore - solBalanceAfter) / 1e9; // lamports → SOL
+            if (solSpent > 0 && solSpent < 0.1) { // Sanity: ignore if >0.1 SOL (likely a swap, not gas)
+                actualGasCostUsd = solSpent * 200; // ~$200/SOL rough estimate
+            }
+        } catch { /* non-critical */ }
 
         this.dataCollector.recordCycle({
             timestamp: Date.now(),
@@ -549,7 +603,7 @@ export class Orchestrator {
             rebalanceTriggered: decision.shouldRebalance && !decision.blocked,
             rebalanceReason: decision.reason,
             rebalanceSizeUsd: decision.sizeToAdjust,
-            gasCostUsd: estimatedGasCost * 200, // Rough SOL to USD
+            gasCostUsd: actualGasCostUsd,
         });
 
         this.state = await recordSuccess(this.state);
@@ -760,6 +814,153 @@ export class Orchestrator {
                 sizeToAdjust,
             });
             alerts.txFailure('rebalance', error instanceof Error ? error.message : String(error));
+            return false;
+        }
+    }
+
+    /**
+     * Reposition LP: close current out-of-range position and re-open at current price.
+     * Does NOT touch the hedge — the next cycle's delta drift check will adjust it.
+     */
+    private async repositionLP(currentPrice: number): Promise<boolean> {
+        if (!this.lpClient || !this.jupiterClient) {
+            log.error({ event: 'reposition_failed', error: 'Clients not initialized' });
+            return false;
+        }
+
+        try {
+            // Step 1: Get current LP positions
+            const positions = await this.lpClient.fetchPositions();
+            if (positions.length === 0) {
+                log.warn({ event: 'reposition_skipped', reason: 'no_lp_positions' });
+                return false;
+            }
+
+            log.info({
+                event: 'reposition_starting',
+                positionCount: positions.length,
+                currentPrice,
+                newRange: `±${(config.RANGE_WIDTH_PERCENT * 100).toFixed(1)}%`,
+            });
+
+            // Step 2: Close all existing LP positions (collects fees automatically)
+            for (const pos of positions) {
+                const closeResult = await this.lpClient.closePosition(pos.mint);
+                if (!closeResult) {
+                    log.error({ event: 'reposition_close_failed', mint: pos.mint.toBase58() });
+                    alertWarning('REPOSITION_FAILED', 'Failed to close old LP position');
+                    return false;
+                }
+                log.info({ event: 'reposition_closed_old', tx: closeResult.txSignature });
+            }
+
+            // Step 3: Wait for state to settle
+            await sleep(2000);
+
+            // Step 4: Check token balances and re-open LP at current price
+            const connection = getRpcManager().getConnection();
+            const { getAssociatedTokenAddress, TOKEN_2022_PROGRAM_ID } = await import('@solana/spl-token');
+
+            // Get TSLAx balance (Token2022, 8 decimals)
+            let tslaxBalance = 0n;
+            try {
+                const tslaxAta = await getAssociatedTokenAddress(
+                    config.TSLAX_MINT, this.wallet!.publicKey, false, TOKEN_2022_PROGRAM_ID
+                );
+                const info = await connection.getTokenAccountBalance(tslaxAta);
+                tslaxBalance = BigInt(info.value.amount);
+            } catch { tslaxBalance = 0n; }
+
+            // Get USDC balance (6 decimals)
+            let usdcBalance = 0n;
+            try {
+                const usdcAta = await getAssociatedTokenAddress(config.USDC_MINT, this.wallet!.publicKey);
+                const info = await connection.getTokenAccountBalance(usdcAta);
+                usdcBalance = BigInt(info.value.amount);
+            } catch { usdcBalance = 0n; }
+
+            const tslaxValueUsd = (Number(tslaxBalance) / 1e8) * currentPrice;
+            const usdcValueUsd = Number(usdcBalance) / 1e6;
+
+            log.info({
+                event: 'reposition_balances',
+                tslaxBalance: tslaxBalance.toString(),
+                tslaxValueUsd: tslaxValueUsd.toFixed(2),
+                usdcValueUsd: usdcValueUsd.toFixed(2),
+            });
+
+            // Step 5: Calculate target token ratio for new range
+            const { tokenARatio } = this.lpClient.calculateTokenRatio(config.RANGE_WIDTH_PERCENT);
+            const totalLpValue = tslaxValueUsd + usdcValueUsd;
+
+            // Reserve hedge collateral (don't LP with all capital)
+            const hedgeCollateral = totalLpValue / (config.DEFAULT_LEVERAGE + 1) / config.DEFAULT_LEVERAGE;
+            const lpCapital = totalLpValue - hedgeCollateral;
+            const targetTslaxUsd = lpCapital * tokenARatio;
+
+            // Swap delta if needed (only swap the difference, not 50% of position)
+            const tslaxDeltaUsd = targetTslaxUsd - tslaxValueUsd;
+
+            if (tslaxDeltaUsd > 1) {
+                // Need more TSLAx
+                const swapMicro = BigInt(Math.floor(tslaxDeltaUsd * 1.02 * 1e6)); // 2% buffer
+                const swapResult = await this.jupiterClient.swapUsdcToTslax(swapMicro);
+                if (!swapResult) {
+                    log.error({ event: 'reposition_swap_failed', direction: 'usdc_to_tslax' });
+                    alertWarning('REPOSITION_FAILED', 'Failed to swap USDC→TSLAx for reposition');
+                    return false;
+                }
+                tslaxBalance += BigInt(swapResult.tslaxAmount);
+            } else if (tslaxDeltaUsd < -1) {
+                // Have excess TSLAx — swap some back
+                const excessTslax = BigInt(Math.floor((-tslaxDeltaUsd / currentPrice) * 1e8));
+                const swapResult = await this.jupiterClient.swapTslaxToUsdc(excessTslax);
+                if (!swapResult) {
+                    log.warn({ event: 'reposition_swap_failed', direction: 'tslax_to_usdc' });
+                    // Non-fatal: just open with current balance
+                }
+            }
+
+            // Re-read USDC balance after any swaps
+            try {
+                const usdcAta = await getAssociatedTokenAddress(config.USDC_MINT, this.wallet!.publicKey);
+                const info = await connection.getTokenAccountBalance(usdcAta);
+                usdcBalance = BigInt(info.value.amount);
+            } catch { /* use previous */ }
+
+            // Step 6: Open new LP at current price
+            const lpResult = await this.lpClient.openPosition(
+                tslaxBalance,
+                usdcBalance,
+                config.RANGE_WIDTH_PERCENT
+            );
+
+            if (!lpResult) {
+                log.error({ event: 'reposition_open_failed' });
+                alertWarning('REPOSITION_FAILED', 'Failed to open new LP position');
+                return false;
+            }
+
+            // Reset out-of-range tracking
+            this.state = await transitionState(this.state!, this.state!.currentState, {
+                outOfRangeSince: null,
+            });
+
+            alertInfo('LP_REPOSITIONED', `Repositioned LP at $${currentPrice.toFixed(2)} ±${(config.RANGE_WIDTH_PERCENT * 100).toFixed(1)}%`);
+            log.info({
+                event: 'reposition_complete',
+                newLpTx: lpResult.txSignature,
+                price: currentPrice,
+                range: config.RANGE_WIDTH_PERCENT,
+            });
+
+            return true;
+        } catch (error) {
+            log.error({
+                event: 'reposition_error',
+                error: error instanceof Error ? error.message : String(error),
+            });
+            alerts.txFailure('reposition', error instanceof Error ? error.message : String(error));
             return false;
         }
     }

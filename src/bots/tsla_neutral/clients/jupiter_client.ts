@@ -372,6 +372,17 @@ export class JupiterClient {
       return true;
     }
 
+    // Top-up failed, but if we have enough for a few transactions, don't block operations
+    const MIN_OPERABLE_SOL = 0.001; // ~200 transactions at base fee
+    if (solBalance / 1e9 >= MIN_OPERABLE_SOL) {
+      log.warn({
+        event: 'sol_top_up_failed',
+        msg: 'Top-up swap failed but enough SOL for operations',
+        balance: (solBalance / 1e9).toFixed(4),
+      });
+      return true;
+    }
+
     log.error({ event: 'sol_top_up_failed' });
     return false;
   }

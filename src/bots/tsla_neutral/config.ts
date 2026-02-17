@@ -103,12 +103,14 @@ export const config = {
     MIN_SOL_RESERVE: optionalEnvNumber('MIN_SOL_RESERVE', 0.1),
     LIQUIDATION_WARNING_PERCENT: optionalEnvNumber('LIQUIDATION_WARNING_PERCENT', 0.10), // Alert if within 10%
     FUNDING_RATE_SPIKE_THRESHOLD: optionalEnvNumber('FUNDING_RATE_SPIKE_THRESHOLD', 0.001), // 0.1% per hour
+    MAX_RECOVERY_ATTEMPTS: optionalEnvNumber('MAX_RECOVERY_ATTEMPTS', 3), // Circuit breaker after 3 failed recoveries
+    PYTH_MAX_STALENESS_MS: optionalEnvNumber('PYTH_MAX_STALENESS_MS', 60000), // Reject prices >60s old
 
     // ──────────────────────────────────────────────────────────────────────────
     // Position Sizing & Execution
     // ──────────────────────────────────────────────────────────────────────────
     MAX_POSITION_SIZE_USD: optionalEnvNumber('MAX_POSITION_SIZE_USD', 10000), // $10k max per position
-    MIN_REBALANCE_SIZE_USD: optionalEnvNumber('MIN_REBALANCE_SIZE_USD', 0), // No minimum - hedge any size
+    MIN_REBALANCE_SIZE_USD: optionalEnvNumber('MIN_REBALANCE_SIZE_USD', 1), // Minimum $1 to avoid dust trades
     DEFAULT_LEVERAGE: optionalEnvNumber('DEFAULT_LEVERAGE', 2), // 2x leverage = 50% collateral
     MIN_COLLATERAL_USD: optionalEnvNumber('MIN_COLLATERAL_USD', 0), // No minimum for testing
     GAS_TOP_UP_THRESHOLD_SOL: optionalEnvNumber('GAS_TOP_UP_THRESHOLD_SOL', 0.05), // Swap for gas if below

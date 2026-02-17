@@ -8,7 +8,7 @@ import {
     canOperate,
 } from '../state_machine';
 import { getRpcManager } from '../clients/rpc_manager';
-import { evaluateRebalance } from './risk_manager';
+import { evaluateRebalance, checkLiquidationRisk } from './risk_manager';
 import { loggers, logMetricsSnapshot } from '../observability/logger';
 import { rebalanceCounter } from '../observability/metrics';
 import { alerts, alertInfo, alertWarning } from '../observability/alerter';
@@ -38,6 +38,7 @@ export class Orchestrator {
     private pythClient: PythClient;
     private wallet: Keypair | null = null;
     private hasBootstrapped = false;
+    private recoveryAttempts = 0;
     private dataCollector: DataCollector;
 
     // (EOD unwind removed — LP + hedge stay open 24/7)
@@ -92,8 +93,10 @@ export class Orchestrator {
         const RAYDIUM_API = 'https://api-v3.raydium.io';
         const POOL_ID = config.RAYDIUM_POOL_ADDRESS.toBase58();
 
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 10_000);
         try {
-            const response = await fetch(`${RAYDIUM_API}/pools/info/ids?ids=${POOL_ID}`);
+            const response = await fetch(`${RAYDIUM_API}/pools/info/ids?ids=${POOL_ID}`, { signal: controller.signal });
             const json = await response.json() as { success: boolean; data: any[] };
 
             if (json.success && json.data?.[0]) {
@@ -113,6 +116,8 @@ export class Orchestrator {
                 event: 'pool_apr_fetch_error',
                 error: error instanceof Error ? error.message : String(error),
             });
+        } finally {
+            clearTimeout(timeout);
         }
     }
 
@@ -269,13 +274,18 @@ export class Orchestrator {
             await this.jupiterClient.ensureSolBalance();
         }
 
-        // 1. Fetch TSLA price from Pyth
+        // 1. Fetch TSLA price from Pyth (with staleness check)
         let tslaPrice = 0;
         try {
             const priceData = await this.pythClient.getTSLAPrice();
             if (priceData) {
+                const ageMs = Date.now() - (priceData.publishTime * 1000);
+                if (ageMs > config.PYTH_MAX_STALENESS_MS) {
+                    log.warn({ event: 'pyth_price_stale', ageMs, price: priceData.price, maxAge: config.PYTH_MAX_STALENESS_MS });
+                    return; // Skip cycle — stale price is dangerous for position decisions
+                }
                 tslaPrice = priceData.price;
-                log.debug({ event: 'pyth_price_fetched', price: tslaPrice, confidence: priceData.confidence });
+                log.debug({ event: 'pyth_price_fetched', price: tslaPrice, confidence: priceData.confidence, ageMs });
             }
         } catch (error) {
             log.warn({ event: 'pyth_fetch_error', error: error instanceof Error ? error.message : String(error) });
@@ -292,6 +302,7 @@ export class Orchestrator {
         }
 
         // 2. Fetch LP positions and calculate delta
+        // CRITICAL: If fetch fails, skip cycle — never assume empty positions (causes duplicates)
         let lpDelta = 0;
         let isLpInRange = true;
         let lpPositionCount = 0;
@@ -333,11 +344,13 @@ export class Orchestrator {
                     }
                 }
             } catch (error) {
-                log.warn({ event: 'lp_fetch_error', error: error instanceof Error ? error.message : String(error) });
+                log.error({ event: 'lp_fetch_critical', error: error instanceof Error ? error.message : String(error) });
+                return; // Skip cycle — RPC failure must NOT assume empty positions
             }
         }
 
         // 3. Fetch hedge positions and calculate delta
+        // CRITICAL: If fetch fails, skip cycle — never assume empty positions (causes duplicates)
         let hedgeDelta = 0;
         let hedgePositions: HedgePosition[] = [];
         if (this.flashTradeClient) {
@@ -347,8 +360,19 @@ export class Orchestrator {
                     hedgeDelta += this.flashTradeClient.calculatePositionDelta(pos);
                 }
                 log.debug({ event: 'hedge_positions_fetched', count: hedgePositions.length, totalDelta: hedgeDelta });
+
+                // Check liquidation risk on all hedge positions
+                for (const pos of hedgePositions) {
+                    if (pos.liquidationPrice > 0 && tslaPrice > 0) {
+                        const { isAtRisk, distancePercent } = checkLiquidationRisk(tslaPrice, pos.liquidationPrice, pos.side as 'SHORT' | 'LONG');
+                        if (isAtRisk) {
+                            alertWarning('LIQUIDATION_RISK', `${pos.side} liq $${pos.liquidationPrice.toFixed(2)} (${(distancePercent * 100).toFixed(1)}% away), price $${tslaPrice.toFixed(2)}`);
+                        }
+                    }
+                }
             } catch (error) {
-                log.warn({ event: 'hedge_fetch_error', error: error instanceof Error ? error.message : String(error) });
+                log.error({ event: 'hedge_fetch_critical', error: error instanceof Error ? error.message : String(error) });
+                return; // Skip cycle — RPC failure must NOT assume empty positions
             }
         }
 
@@ -457,11 +481,28 @@ export class Orchestrator {
 
                 if (success) {
                     rebalanceCounter.inc({ reason: decision.reason, status: 'success' });
+                    this.recoveryAttempts = 0; // Reset circuit breaker on success
                     this.state = await transitionState(this.state!, this.state!.currentState, {
                         lastRebalanceTime: Date.now(),
                     });
                 } else {
                     rebalanceCounter.inc({ reason: decision.reason, status: 'failure' });
+
+                    // Circuit breaker: if recovery/fullReset keeps failing, stop trying
+                    if (decision.reason === 'out_of_range_too_long' || !isLpInRange) {
+                        this.recoveryAttempts++;
+                        if (this.recoveryAttempts >= config.MAX_RECOVERY_ATTEMPTS) {
+                            log.error({
+                                event: 'recovery_circuit_breaker',
+                                attempts: this.recoveryAttempts,
+                                msg: 'Max recovery attempts reached, pausing operations',
+                            });
+                            alertWarning('CIRCUIT_BREAKER', `Recovery failed ${this.recoveryAttempts} times consecutively — manual intervention needed`);
+                            this.state = await transitionState(this.state!, BotState.ERROR_RECOVERY, {
+                                consecutiveFailures: this.recoveryAttempts,
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -615,8 +656,11 @@ export class Orchestrator {
                     // Try to swap SOL to USDC via Jupiter
                     if (this.jupiterClient) {
                         try {
-                            // Convert USD to SOL amount (rough estimate: $200/SOL)
-                            const solPrice = 200; // TODO: fetch from Pyth
+                            // Get real SOL price from Jupiter
+                            let solPrice = 200; // fallback
+                            try {
+                                solPrice = await this.jupiterClient.getPrice(TOKEN_MINTS.SOL, TOKEN_MINTS.USDC);
+                            } catch { /* use fallback */ }
                             const solNeeded = swapAmount / solPrice;
                             const lamports = BigInt(Math.ceil(solNeeded * 1e9));
 

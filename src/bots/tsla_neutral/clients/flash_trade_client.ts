@@ -616,16 +616,27 @@ export class FlashTradeClient {
                     rawCumulativeLockFee: data.cumulativeLockFeeSnapshot?.toString(),
                 });
 
+                // Calculate liquidation price from position data
+                const collateralUsd = Number(data.collateralUsd || data.collateralAmount || 0) / 1e6;
+                let liquidationPrice = 0;
+                if (entryPrice > 0 && size > 0 && collateralUsd > 0) {
+                    // SHORT: liquidation when price rises enough to consume collateral
+                    // LONG: liquidation when price drops enough to consume collateral
+                    liquidationPrice = side === 'SHORT'
+                        ? entryPrice * (1 + collateralUsd / size)
+                        : entryPrice * (1 - collateralUsd / size);
+                }
+
                 return {
                     positionId: pos.publicKey.toBase58(),
                     market: this.targetSymbol,
                     side,
                     size,
                     entryPrice,
-                    leverage: 1,
-                    liquidationPrice: 0, // Calculate from metrics
+                    leverage: size > 0 && collateralUsd > 0 ? size / collateralUsd : 1,
+                    liquidationPrice,
                     unrealizedPnl: 0,
-                    marginUsed: Number(data.collateralAmount || 0) / 1e6,
+                    marginUsed: collateralUsd,
                     unsettledFeesUsd,
                     cumulativeLockFeeSnapshot,
                 };

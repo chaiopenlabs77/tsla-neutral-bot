@@ -1313,7 +1313,8 @@ export class Orchestrator {
             const hedgeResult = await this.flashTradeClient.openShortPosition(
                 hedgeSize,
                 collateral,
-                config.MAX_SLIPPAGE_BPS
+                config.MAX_SLIPPAGE_BPS,
+                currentPrice
             );
 
             if (!hedgeResult) {

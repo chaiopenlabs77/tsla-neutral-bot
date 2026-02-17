@@ -411,6 +411,20 @@ export class Orchestrator {
                         success = false; // Don't count as failure — just wait
                     } else {
                         success = await this.repositionLP(tslaPrice);
+
+                        // After successful reposition, open hedge in the same cycle
+                        // (don't wait for next cycle's delta_drift)
+                        if (success && hedgePositions.length === 0 && withinHours) {
+                            const newLpPositions = await this.lpClient!.fetchPositions();
+                            let newLpDelta = 0;
+                            for (const pos of newLpPositions) {
+                                newLpDelta += this.lpClient!.calculatePositionDelta(pos, tslaPrice);
+                            }
+                            if (newLpDelta > config.MIN_REBALANCE_SIZE_USD) {
+                                log.info({ event: 'post_reposition_hedging', lpDelta: newLpDelta });
+                                await this.executeRebalance(newLpDelta, tslaPrice, []);
+                            }
+                        }
                     }
                 } else if (!withinHours) {
                     // Hedge rebalance only during market hours (Flash Trade restriction)

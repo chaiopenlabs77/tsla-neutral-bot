@@ -485,6 +485,10 @@ export class LPClient {
                 hasPoolKeys: !!poolData.poolKeys,
             });
 
+            // Add 5% slippage buffer to otherAmountMax to account for price movement
+            // between simulation and on-chain execution. The SDK uses only what's needed.
+            const otherAmountMaxBN = new BN(amountB.toString()).muln(105).divn(100);
+
             const { execute, extInfo } = await this.raydium.clmm.openPositionFromBase({
                 poolInfo: poolData.poolInfo,
                 poolKeys: poolData.poolKeys,
@@ -495,7 +499,7 @@ export class LPClient {
                 tickUpper: upperTick,
                 base: 'MintA',
                 baseAmount: new BN(amountA.toString()),
-                otherAmountMax: new BN(amountB.toString()),
+                otherAmountMax: otherAmountMaxBN,
                 txVersion: 'V0',
                 nft2022: true, // Use Token2022 for position NFT
             });
@@ -503,9 +507,14 @@ export class LPClient {
             // Execute the transaction
             const { txId } = await execute();
 
-            // Verify transaction succeeded on-chain
+            // Wait for on-chain confirmation (up to 30s)
             const connection = this.raydium.connection;
-            const confirmation = await connection.getSignatureStatus(txId, { searchTransactionHistory: true });
+            const latestBlockhash = await connection.getLatestBlockhash();
+            const confirmation = await connection.confirmTransaction({
+                signature: txId,
+                blockhash: latestBlockhash.blockhash,
+                lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+            }, 'confirmed');
 
             if (confirmation.value?.err) {
                 log.error({
@@ -521,7 +530,6 @@ export class LPClient {
                 event: 'lp_position_opened',
                 txSignature: txId,
                 nftMint: extInfo?.nftMint?.toBase58(),
-                confirmationStatus: confirmation.value?.confirmationStatus,
             });
             txSubmittedCounter.inc({ type: 'open_lp', status: 'success' });
 

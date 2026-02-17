@@ -1269,21 +1269,19 @@ export class Orchestrator {
             const actualTslaxValueUsd = (Number(tslaxAmount) / 1e8) * currentPrice;
 
             // Step 2: Open LP position
-            // Pass all available USDC as max - SDK will calculate exact amount needed
-            // based on TSLAx amount and tick range
-            const availableUsdcMicro = usdcBalanceMicro - BigInt(Math.floor(hedgeCollateralUsd * 1_000_000));
-
+            // Pass ALL USDC as max — SDK uses only what's needed for the tick range.
+            // Remaining USDC after LP open is used for hedge collateral.
             log.info({
                 event: 'bootstrap_opening_lp',
                 tslaxAmount: tslaxAmount.toString(),
-                availableUsdcForLp: availableUsdcMicro.toString(),
+                availableUsdcForLp: usdcBalanceMicro.toString(),
                 actualTslaxValueUsd: actualTslaxValueUsd.toFixed(2),
                 rangePercent,
             });
 
             const lpResult = await this.lpClient.openPosition(
                 tslaxAmount,
-                availableUsdcMicro, // Pass max available, SDK calculates exact
+                usdcBalanceMicro, // All USDC as max, SDK calculates exact needed
                 rangePercent
             );
 
@@ -1302,17 +1300,32 @@ export class Orchestrator {
                 txSignature: lpResult.txSignature,
             });
 
-            // Step 3: Open matching hedge
-            // Hedge size should match ACTUAL TSLAx value
+            // Step 3: Open matching hedge using remaining USDC as collateral
+            // Re-read USDC balance — LP consumed some, remainder is for hedge
+            let remainingUsdc = 0;
+            try {
+                const { getAssociatedTokenAddress: getAta } = await import('@solana/spl-token');
+                const usdcAta = await getAta(config.USDC_MINT, this.wallet.publicKey);
+                const info = await connection.getTokenAccountBalance(usdcAta);
+                remainingUsdc = Number(info.value.amount) / 1e6;
+            } catch { remainingUsdc = 0; }
+
             const hedgeSize = actualTslaxValueUsd;
-            const collateral = Math.min(hedgeCollateralUsd, hedgeSize / config.DEFAULT_LEVERAGE);
+            const collateral = Math.min(remainingUsdc * 0.95, hedgeSize / config.DEFAULT_LEVERAGE); // Leave 5% buffer
 
             log.info({
                 event: 'bootstrap_opening_hedge',
                 actualTslaxValueUsd: actualTslaxValueUsd.toFixed(2),
                 hedgeSizeUsd: hedgeSize.toFixed(2),
                 collateralUsd: collateral.toFixed(2),
+                remainingUsdc: remainingUsdc.toFixed(2),
             });
+
+            if (collateral < 0.50) {
+                log.warn({ event: 'bootstrap_hedge_skipped', reason: 'insufficient_collateral', remaining: remainingUsdc.toFixed(2) });
+                alertWarning('BOOTSTRAP_PARTIAL', 'LP opened but not enough USDC for hedge');
+                return false;
+            }
 
             const hedgeResult = await this.flashTradeClient.openShortPosition(
                 hedgeSize,

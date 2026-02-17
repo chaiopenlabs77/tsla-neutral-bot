@@ -419,6 +419,13 @@ export class Orchestrator {
                 } else {
                     // Normal delta drift — adjust hedge (market hours only)
                     success = await this.executeRebalance(decision.sizeToAdjust, tslaPrice, hedgePositions);
+
+                    // RECOVERY: If rebalance failed and LP is stranded out of range with no hedge,
+                    // close LP to free capital and re-bootstrap from scratch
+                    if (!success && !isLpInRange && hedgePositions.length === 0) {
+                        log.info({ event: 'recovery_triggered', reason: 'cannot_hedge_stranded_lp' });
+                        success = await this.recoverStuckPosition(tslaPrice, lpPositions);
+                    }
                 }
 
                 if (success) {
@@ -886,6 +893,124 @@ export class Orchestrator {
                 error: error instanceof Error ? error.message : String(error),
             });
             alerts.txFailure('reposition', error instanceof Error ? error.message : String(error));
+            return false;
+        }
+    }
+
+    /**
+     * Recovery: Close stranded out-of-range LP, swap TSLAx → USDC, and re-bootstrap.
+     * Triggered when LP is out of range, no hedge exists, and we can't open a hedge
+     * because there's insufficient liquid capital (USDC/SOL).
+     */
+    private async recoverStuckPosition(currentPrice: number, lpPositions: LPPosition[]): Promise<boolean> {
+        if (!this.lpClient || !this.jupiterClient || !this.wallet) {
+            log.error({ event: 'recovery_failed', error: 'Clients not initialized' });
+            return false;
+        }
+
+        log.info({
+            event: 'recovery_starting',
+            reason: 'out_of_range_no_hedge_insufficient_capital',
+            lpPositionCount: lpPositions.length,
+            currentPrice,
+        });
+
+        try {
+            // Step 1: Close all LP positions to free capital
+            for (const pos of lpPositions) {
+                const closeResult = await this.lpClient.closePosition(pos.mint);
+                if (!closeResult) {
+                    log.error({ event: 'recovery_close_lp_failed', mint: pos.mint.toBase58() });
+                    alertWarning('RECOVERY_FAILED', 'Failed to close stranded LP position');
+                    return false;
+                }
+                log.info({ event: 'recovery_lp_closed', tx: closeResult.txSignature });
+            }
+
+            await sleep(2000);
+
+            // Step 2: Swap all TSLAx → USDC to consolidate capital
+            const { getAssociatedTokenAddress, TOKEN_2022_PROGRAM_ID } = await import('@solana/spl-token');
+            const connection = getRpcManager().getConnection();
+
+            let tslaxBalance = 0n;
+            try {
+                const tslaxAta = await getAssociatedTokenAddress(
+                    config.TSLAX_MINT, this.wallet.publicKey, false, TOKEN_2022_PROGRAM_ID
+                );
+                const info = await connection.getTokenAccountBalance(tslaxAta);
+                tslaxBalance = BigInt(info.value.amount);
+            } catch { tslaxBalance = 0n; }
+
+            // Check how much USDC we already have
+            let usdcBalance = 0;
+            try {
+                const usdcAta = await getAssociatedTokenAddress(config.USDC_MINT, this.wallet.publicKey);
+                const info = await connection.getTokenAccountBalance(usdcAta);
+                usdcBalance = Number(info.value.amount) / 1e6;
+            } catch { usdcBalance = 0; }
+
+            // Calculate how much USDC we need for bootstrap:
+            // bootstrapPosition will need USDC for hedge collateral + LP USDC side
+            // LP uses tokenBRatio of capital as USDC, hedge uses 1/leverage of LP value
+            const tslaxValueUsd = (Number(tslaxBalance) / 1e8) * currentPrice;
+            const totalCapital = tslaxValueUsd + usdcBalance;
+            const { tokenBRatio } = this.lpClient.calculateTokenRatio(config.RANGE_WIDTH_PERCENT);
+            const lpValue = totalCapital / (1 + 1 / config.DEFAULT_LEVERAGE);
+            const hedgeCollateral = lpValue / config.DEFAULT_LEVERAGE;
+            const usdcNeeded = lpValue * tokenBRatio + hedgeCollateral;
+            const usdcShortfall = usdcNeeded - usdcBalance;
+
+            if (tslaxBalance > 0n && usdcShortfall > 0.50) {
+                // Only swap enough TSLAx to cover the USDC shortfall (not all of it)
+                const tslaxToSwap = Math.min(
+                    Number(tslaxBalance),
+                    Math.ceil((usdcShortfall * 1.05 / currentPrice) * 1e8) // 5% buffer
+                );
+                const swapAmount = BigInt(tslaxToSwap);
+
+                log.info({
+                    event: 'recovery_swapping_tslax',
+                    tslaxBalance: tslaxBalance.toString(),
+                    tslaxToSwap: swapAmount.toString(),
+                    usdcShortfall: usdcShortfall.toFixed(2),
+                    estimatedUsd: ((tslaxToSwap / 1e8) * currentPrice).toFixed(2),
+                });
+
+                const swapResult = await this.jupiterClient.swapTslaxToUsdc(swapAmount);
+                if (swapResult) {
+                    log.info({
+                        event: 'recovery_tslax_swapped',
+                        tx: swapResult.txSignature,
+                        usdcReceived: swapResult.usdcAmount,
+                    });
+                } else {
+                    log.warn({ event: 'recovery_tslax_swap_failed' });
+                    // Non-fatal: bootstrap will work with whatever capital is available
+                }
+            }
+
+            await sleep(2000);
+
+            // Step 3: Re-bootstrap (LP + hedge) with recovered capital
+            // bootstrapPosition handles TSLAx/USDC ratio internally
+            this.hasBootstrapped = false; // Allow bootstrap to run
+            const success = await this.bootstrapPosition(currentPrice);
+
+            if (success) {
+                alertInfo('POSITION_RECOVERED', `Recovered stuck position at $${currentPrice.toFixed(2)}`);
+                log.info({ event: 'recovery_complete', price: currentPrice });
+            } else {
+                log.warn({ event: 'recovery_bootstrap_failed' });
+            }
+
+            return success;
+        } catch (error) {
+            log.error({
+                event: 'recovery_error',
+                error: error instanceof Error ? error.message : String(error),
+            });
+            alerts.txFailure('recovery', error instanceof Error ? error.message : String(error));
             return false;
         }
     }

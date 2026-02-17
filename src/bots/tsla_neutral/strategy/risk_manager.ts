@@ -155,25 +155,19 @@ export function evaluateRebalance(
         };
     }
 
-    // Check if LP is out of range
+    // Check if LP is out of range — reposition immediately
+    // (price stabilization check in orchestrator prevents repositioning during volatile moves)
     if (!isLpInRange && state.outOfRangeSince) {
-        const outOfRangeDuration = Date.now() - state.outOfRangeSince;
-        const hasHedge = Math.abs(hedgeDelta) > 0;
-
-        // No hedge = reposition immediately (LP is earning nothing and we're exposed)
-        // Has hedge = wait for timer (we're still delta-neutral, just not earning fees)
-        if (!hasHedge || outOfRangeDuration > config.MAX_OUT_OF_RANGE_DURATION_MS) {
-            return {
-                shouldRebalance: true,
-                reason: 'out_of_range_too_long',
-                currentDelta: netDelta,
-                targetDelta: 0,
-                sizeToAdjust: -hedgeDelta, // Close hedge to match 0 LP exposure
-                estimatedSlippage: 0,
-                estimatedGasCost,
-                blocked: false,
-            };
-        }
+        return {
+            shouldRebalance: true,
+            reason: 'out_of_range_too_long',
+            currentDelta: netDelta,
+            targetDelta: 0,
+            sizeToAdjust: -hedgeDelta, // Close hedge to match 0 LP exposure
+            estimatedSlippage: 0,
+            estimatedGasCost,
+            blocked: false,
+        };
     }
 
     // Check delta drift threshold

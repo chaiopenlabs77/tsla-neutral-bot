@@ -412,18 +412,25 @@ export class Orchestrator {
                     } else {
                         success = await this.repositionLP(tslaPrice);
 
-                        // After successful reposition, open hedge in the same cycle
-                        // (don't wait for next cycle's delta_drift)
-                        if (success && hedgePositions.length === 0 && withinHours) {
-                            const newLpPositions = await this.lpClient!.fetchPositions();
-                            let newLpDelta = 0;
-                            for (const pos of newLpPositions) {
-                                newLpDelta += this.lpClient!.calculatePositionDelta(pos, tslaPrice);
+                        if (success) {
+                            // After successful reposition, open hedge in the same cycle
+                            // (don't wait for next cycle's delta_drift)
+                            if (hedgePositions.length === 0 && withinHours) {
+                                const newLpPositions = await this.lpClient!.fetchPositions();
+                                let newLpDelta = 0;
+                                for (const pos of newLpPositions) {
+                                    newLpDelta += this.lpClient!.calculatePositionDelta(pos, tslaPrice);
+                                }
+                                if (newLpDelta > config.MIN_REBALANCE_SIZE_USD) {
+                                    log.info({ event: 'post_reposition_hedging', lpDelta: newLpDelta });
+                                    await this.executeRebalance(newLpDelta, tslaPrice, []);
+                                }
                             }
-                            if (newLpDelta > config.MIN_REBALANCE_SIZE_USD) {
-                                log.info({ event: 'post_reposition_hedging', lpDelta: newLpDelta });
-                                await this.executeRebalance(newLpDelta, tslaPrice, []);
-                            }
+                        } else if (hedgePositions.length > 0 && withinHours) {
+                            // Reposition failed with existing hedge — capital is stuck.
+                            // Full reset: close hedge (frees collateral) → close LP → consolidate → re-bootstrap
+                            log.info({ event: 'full_reset_triggered', reason: 'reposition_failed_with_hedge' });
+                            success = await this.fullPositionReset(tslaPrice, lpPositions);
                         }
                     }
                 } else if (!withinHours) {
@@ -434,11 +441,17 @@ export class Orchestrator {
                     // Normal delta drift — adjust hedge (market hours only)
                     success = await this.executeRebalance(decision.sizeToAdjust, tslaPrice, hedgePositions);
 
-                    // RECOVERY: If rebalance failed and LP is stranded out of range with no hedge,
-                    // close LP to free capital and re-bootstrap from scratch
-                    if (!success && !isLpInRange && hedgePositions.length === 0) {
-                        log.info({ event: 'recovery_triggered', reason: 'cannot_hedge_stranded_lp' });
-                        success = await this.recoverStuckPosition(tslaPrice, lpPositions);
+                    // RECOVERY: If rebalance failed and LP is stranded out of range,
+                    // close everything, consolidate capital, and re-bootstrap from scratch
+                    if (!success && !isLpInRange) {
+                        if (hedgePositions.length === 0) {
+                            log.info({ event: 'recovery_triggered', reason: 'cannot_hedge_stranded_lp' });
+                            success = await this.recoverStuckPosition(tslaPrice, lpPositions);
+                        } else {
+                            // Has hedge but can't increase it (no liquid capital) — full reset
+                            log.info({ event: 'full_reset_triggered', reason: 'stuck_with_undersized_hedge' });
+                            success = await this.fullPositionReset(tslaPrice, lpPositions);
+                        }
                     }
                 }
 
@@ -913,6 +926,55 @@ export class Orchestrator {
                 error: error instanceof Error ? error.message : String(error),
             });
             alerts.txFailure('reposition', error instanceof Error ? error.message : String(error));
+            return false;
+        }
+    }
+
+    /**
+     * Full position reset: close ALL positions (hedge + LP), consolidate capital, re-bootstrap.
+     * Triggered when bot is stuck: has hedge but can't increase it (no liquid capital),
+     * LP is out of range, and executeRebalance keeps failing.
+     */
+    private async fullPositionReset(currentPrice: number, lpPositions: LPPosition[]): Promise<boolean> {
+        if (!this.flashTradeClient || !this.lpClient || !this.jupiterClient || !this.wallet) {
+            log.error({ event: 'full_reset_failed', error: 'Clients not initialized' });
+            return false;
+        }
+
+        log.info({
+            event: 'full_reset_starting',
+            reason: 'stuck_with_hedge_and_oor_lp',
+            lpPositionCount: lpPositions.length,
+            currentPrice,
+        });
+
+        try {
+            // Step 1: Close ALL hedge positions (frees USDC collateral back to wallet)
+            const hedgeResult = await this.flashTradeClient.closePosition(config.MAX_SLIPPAGE_BPS);
+            if (!hedgeResult) {
+                log.error({ event: 'full_reset_close_hedge_failed' });
+                alertWarning('FULL_RESET_FAILED', 'Could not close hedge position');
+                return false;
+            }
+            log.info({ event: 'full_reset_hedge_closed', tx: hedgeResult.txSignature });
+
+            await sleep(2000);
+
+            // Step 2: Now that hedge is closed, use existing recovery flow
+            // (closes LP → consolidates tokens → re-bootstraps)
+            const recoveryResult = await this.recoverStuckPosition(currentPrice, lpPositions);
+
+            if (recoveryResult) {
+                alertInfo('FULL_RESET_COMPLETE', `Full position reset at $${currentPrice.toFixed(2)}`);
+            }
+
+            return recoveryResult;
+        } catch (error) {
+            log.error({
+                event: 'full_reset_error',
+                error: error instanceof Error ? error.message : String(error),
+            });
+            alerts.txFailure('full_reset', error instanceof Error ? error.message : String(error));
             return false;
         }
     }

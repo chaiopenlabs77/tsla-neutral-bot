@@ -398,14 +398,61 @@ export class FlashTradeClient {
         }
     }
     /**
+     * Add collateral to an existing position.
+     */
+    async addCollateral(
+        positionPubKey: string,
+        collateralUsd: number
+    ): Promise<{ txSignature: string } | null> {
+        this.ensureInitialized();
+
+        if (collateralUsd < 0.01) return { txSignature: 'skip-tiny-collateral' };
+
+        log.info({
+            event: 'adding_collateral',
+            positionPubKey,
+            collateralUsd: collateralUsd.toFixed(2),
+        });
+
+        if (config.DRY_RUN) {
+            return { txSignature: 'dry-run-add-collateral' };
+        }
+
+        try {
+            const collateralBN = new BN(Math.floor(collateralUsd * 1e6)); // 6 decimals for USDC
+
+            const { instructions, additionalSigners } = await this.perpClient.addCollateral(
+                collateralBN,
+                this.targetSymbol,
+                COLLATERAL_SYMBOL,
+                { short: {} },
+                new PublicKey(positionPubKey),
+                this.poolConfig,
+            );
+
+            const txSignature = await this.buildAndSendTransaction(instructions, additionalSigners);
+
+            log.info({ event: 'collateral_added', txSignature, amount: collateralUsd.toFixed(2) });
+            return { txSignature };
+        } catch (error) {
+            log.error({
+                event: 'add_collateral_error',
+                error: error instanceof Error ? error.message : String(error),
+            });
+            return null;
+        }
+    }
+
+    /**
      * Increase an existing short position size.
-     * Use this when a position already exists instead of openPosition.
+     * Adds proportional collateral first, then increases size.
      */
     async increaseShortPosition(
         positionPubKey: string,
         additionalSizeUsd: number,
         maxSlippageBps: number = config.MAX_SLIPPAGE_BPS,
-        fallbackPrice?: number
+        fallbackPrice?: number,
+        collateralUsd?: number
     ): Promise<{ txSignature: string } | null> {
         this.ensureInitialized();
 
@@ -459,7 +506,16 @@ export class FlashTradeClient {
                 side: 'short',
             });
 
-            // Use Flash Trade SDK's increaseSize
+            // Step 1: Add collateral proportional to size increase
+            if (collateralUsd && collateralUsd > 0.01) {
+                const addCollResult = await this.addCollateral(positionPubKey, collateralUsd);
+                if (!addCollResult) {
+                    log.error({ event: 'increase_short_add_collateral_failed' });
+                    return null;
+                }
+            }
+
+            // Step 2: Increase size
             const { instructions, additionalSigners } = await this.perpClient.increaseSize(
                 this.targetSymbol,
                 COLLATERAL_SYMBOL,

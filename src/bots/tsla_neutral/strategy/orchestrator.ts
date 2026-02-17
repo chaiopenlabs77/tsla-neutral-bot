@@ -655,11 +655,14 @@ export class Orchestrator {
                         additionalSizeUsd: cappedSize,
                     });
 
+                    // Pass proportional collateral for the size increase
+                    const additionalCollateral = cappedSize / config.DEFAULT_LEVERAGE;
                     const result = await this.flashTradeClient.increaseShortPosition(
                         existingShort.positionId,
                         cappedSize,
                         config.MAX_SLIPPAGE_BPS,
-                        currentPrice
+                        currentPrice,
+                        additionalCollateral
                     );
 
                     if (result) {
@@ -800,8 +803,11 @@ export class Orchestrator {
                 log.info({ event: 'reposition_closed_old', tx: closeResult.txSignature });
             }
 
-            // Step 3: Wait for state to settle
+            // Step 3: Wait for state to settle, reclaim rent SOL
             await sleep(2000);
+            if (this.jupiterClient) {
+                await this.jupiterClient.ensureSolBalance();
+            }
 
             // Step 4: Check token balances and re-open LP at current price
             const connection = getRpcManager().getConnection();
@@ -943,7 +949,12 @@ export class Orchestrator {
 
             await sleep(2000);
 
-            // Step 2: Swap all TSLAx → USDC to consolidate capital
+            // After closing LP, we recover rent SOL — ensure balance is topped up
+            if (this.jupiterClient) {
+                await this.jupiterClient.ensureSolBalance();
+            }
+
+            // Step 2: Swap TSLAx → USDC as needed for hedge collateral + LP USDC side
             const { getAssociatedTokenAddress, TOKEN_2022_PROGRAM_ID } = await import('@solana/spl-token');
             const connection = getRpcManager().getConnection();
 

@@ -736,7 +736,7 @@ export class Orchestrator {
 
                 // For now, close the entire position
                 // TODO: Support partial closes when SDK supports it
-                const result = await this.flashTradeClient.closePosition(config.MAX_SLIPPAGE_BPS);
+                const result = await this.flashTradeClient.closePosition(config.MAX_SLIPPAGE_BPS, currentPrice);
 
                 if (result) {
                     log.info({
@@ -950,7 +950,7 @@ export class Orchestrator {
 
         try {
             // Step 1: Close ALL hedge positions (frees USDC collateral back to wallet)
-            const hedgeResult = await this.flashTradeClient.closePosition(config.MAX_SLIPPAGE_BPS);
+            const hedgeResult = await this.flashTradeClient.closePosition(config.MAX_SLIPPAGE_BPS, currentPrice);
             if (!hedgeResult) {
                 log.error({ event: 'full_reset_close_hedge_failed' });
                 alertWarning('FULL_RESET_FAILED', 'Could not close hedge position');

@@ -229,14 +229,18 @@ export class LPClient {
             throw new Error('Pool info not loaded');
         }
 
-        const currentPrice = this.getCurrentPrice();
+        // CRITICAL: Use raw pool price for tick calculation, NOT the decimal-adjusted price.
+        // Ticks encode raw price ratios (sqrtPrice^2), not human-readable USD prices.
+        // Pool tick 14112 = raw price 4.1 (i.e., $410 TSLA / 100 decimal adjustment)
+        const sqrtPrice = Number(this.poolInfo.sqrtPriceX64) / Math.pow(2, 64);
+        const rawPrice = sqrtPrice * sqrtPrice;
         const tickSpacing = this.poolInfo.tickSpacing;
 
-        // Calculate price bounds
-        const lowerPrice = currentPrice * (1 - rangePercent);
-        const upperPrice = currentPrice * (1 + rangePercent);
+        // Calculate price bounds in raw price space
+        const lowerPrice = rawPrice * (1 - rangePercent);
+        const upperPrice = rawPrice * (1 + rangePercent);
 
-        // Convert prices to ticks: tick = log(price) / log(1.0001)
+        // Convert raw prices to ticks: tick = log(rawPrice) / log(1.0001)
         const lowerTick =
             Math.floor(Math.log(lowerPrice) / Math.log(1.0001) / tickSpacing) * tickSpacing;
         const upperTick =
@@ -244,9 +248,9 @@ export class LPClient {
 
         log.info({
             event: 'calculated_range',
-            currentPrice,
-            lowerPrice,
-            upperPrice,
+            currentPrice: this.getCurrentPrice(), // Human-readable for logging
+            lowerPrice: lowerPrice * 100, // Decimal-adjusted for logging
+            upperPrice: upperPrice * 100,
             lowerTick,
             upperTick,
             rangePercent,
@@ -740,8 +744,9 @@ export class LPClient {
         position: LPPosition,
         currentPrice: number
     ): { tokenAPercent: number; tokenBPercent: number } {
-        const lowerPrice = Math.pow(1.0001, position.lowerTick);
-        const upperPrice = Math.pow(1.0001, position.upperTick);
+        // Tick-derived prices are raw — multiply by 100 to get USDC/TSLAx (8-6 decimal diff)
+        const lowerPrice = Math.pow(1.0001, position.lowerTick) * 100;
+        const upperPrice = Math.pow(1.0001, position.upperTick) * 100;
 
         if (currentPrice <= lowerPrice) {
             return { tokenAPercent: 1.0, tokenBPercent: 0.0 };

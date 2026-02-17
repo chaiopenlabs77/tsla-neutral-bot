@@ -923,7 +923,7 @@ export class Orchestrator {
         const totalCapitalUsd = Number(usdcBalanceMicro) / 1_000_000; // Convert from micro to USD
 
         // Minimum viable amount check
-        const minRequired = 5; // At least $5 needed for meaningful position
+        const minRequired = 1; // At least $1 needed for meaningful position
         if (totalCapitalUsd < minRequired) {
             log.warn({
                 event: 'bootstrap_skipped',

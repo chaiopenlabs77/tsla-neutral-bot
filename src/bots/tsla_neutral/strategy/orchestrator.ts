@@ -14,7 +14,7 @@ import { rebalanceCounter } from '../observability/metrics';
 import { alerts, alertInfo, alertWarning } from '../observability/alerter';
 import { isShutdownInProgress, onShutdown } from '../utils/shutdown';
 import { sleep, Backoff } from '../utils/backoff';
-import { getMonotonicTime } from '../utils/clock';
+import { getMonotonicTime, isUSMarketOpen } from '../utils/clock';
 import { LPClient } from '../clients/lp_client';
 import { FlashTradeClient } from '../clients/flash_trade_client';
 import { PythClient } from '../clients/pyth_client';
@@ -212,9 +212,10 @@ export class Orchestrator {
                 await this.backoff.wait();
             }
 
-            // Wait for next cycle
+            // Wait for next cycle — slow down to 60s when market is closed (saves RPC quota)
             const cycleDuration = getMonotonicTime() - cycleStart;
-            const sleepTime = Math.max(0, config.LOOP_INTERVAL_MS - cycleDuration);
+            const interval = isUSMarketOpen() ? config.LOOP_INTERVAL_MS : 60_000;
+            const sleepTime = Math.max(0, interval - cycleDuration);
 
             if (sleepTime > 0 && this.isRunning) {
                 await sleep(sleepTime);
@@ -268,6 +269,13 @@ export class Orchestrator {
         }
 
         // ===== LIVE MODE: Fetch real on-chain data =====
+
+        // Skip expensive network calls when US stock market is closed
+        // (Pyth TSLA feed only publishes during NYSE hours — will always be stale otherwise)
+        if (!isUSMarketOpen()) {
+            log.debug({ event: 'market_closed_skip', et: this.getCurrentET() });
+            return;
+        }
 
         // 0. Proactively ensure SOL balance for gas (tops up early so swaps never fail)
         if (this.jupiterClient) {

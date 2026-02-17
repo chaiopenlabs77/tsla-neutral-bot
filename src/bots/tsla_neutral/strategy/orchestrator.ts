@@ -1293,6 +1293,10 @@ export class Orchestrator {
                 return false;
             }
 
+            // Mark bootstrap as complete AFTER LP opens — prevents duplicate LP creation
+            // even if hedge fails. Delta drift will catch the missing hedge next cycle.
+            this.hasBootstrapped = true;
+
             log.info({
                 event: 'bootstrap_lp_opened',
                 txSignature: lpResult.txSignature,
@@ -1319,7 +1323,7 @@ export class Orchestrator {
 
             if (!hedgeResult) {
                 log.error({ event: 'bootstrap_hedge_failed' });
-                alertWarning('BOOTSTRAP_FAILED', 'Failed to open hedge position');
+                alertWarning('BOOTSTRAP_PARTIAL', 'LP opened but hedge failed — delta drift will retry');
                 // LP is already open - next cycle will detect imbalance
                 return false;
             }
@@ -1328,9 +1332,6 @@ export class Orchestrator {
                 event: 'bootstrap_hedge_opened',
                 txSignature: hedgeResult.txSignature,
             });
-
-            // Mark bootstrap as complete
-            this.hasBootstrapped = true;
 
             alertInfo('BOOTSTRAP_COMPLETE', `Initial position created: $${totalCapitalUsd.toFixed(2)} deployed`);
             log.info({

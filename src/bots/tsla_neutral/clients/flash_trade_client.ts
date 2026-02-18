@@ -575,7 +575,9 @@ export class FlashTradeClient {
                     collateralUsd: rawData.collateralUsd?.toString(),
                     entryPrice: JSON.stringify(rawData.entryPrice, (k, v) =>
                         typeof v === 'bigint' ? v.toString() : v),
-                    side: JSON.stringify(rawData.side),
+                    rawUnsettledFeesUsd: rawData.unsettledFeesUsd?.toString(),
+                    rawUnsettledValueUsd: rawData.unsettledValueUsd?.toString(),
+                    rawCumLockFee: rawData.cumulativeLockFeeSnapshot?.toString(),
                 });
             }
 

@@ -375,9 +375,24 @@ export class LPClient {
             const poolData = await this.raydium.clmm.getPoolInfoFromRpc(this.poolAddress.toBase58());
             const sqrtPriceCurrentX64 = poolData.computePoolInfo.sqrtPriceX64;
 
-            // Use SDK to calculate amounts from liquidity
-            const { SqrtPriceMath, LiquidityMath } = await import('@raydium-io/raydium-sdk-v2');
+            // Use SDK to calculate amounts from liquidity and compute real fees
+            const { SqrtPriceMath, LiquidityMath, PositionUtils } = await import('@raydium-io/raydium-sdk-v2');
             const BN = (await import('bn.js')).default;
+
+            // Build tick lookup from pool tick data for fee computation
+            const tickMap = new Map<number, any>();
+            const poolTickData = poolData.tickData[this.poolAddress.toBase58()];
+            if (poolTickData) {
+                for (const ta of Object.values(poolTickData) as any[]) {
+                    if (ta.ticks) {
+                        for (const tick of ta.ticks) {
+                            if (tick && tick.tick !== undefined) {
+                                tickMap.set(tick.tick, tick);
+                            }
+                        }
+                    }
+                }
+            }
 
             const lpPositions: LPPosition[] = positions.map((pos: any) => {
                 // Get sqrt prices for tick bounds using SqrtPriceMath
@@ -397,9 +412,33 @@ export class LPClient {
                 const tokenAAmount = BigInt(amounts.amountA.toString());
                 const tokenBAmount = BigInt(amounts.amountB.toString());
 
-                // Extract uncollected fee amounts from position data
-                const tokenFeesOwedA = BigInt(pos.tokenFeesOwedA?.toString() || '0');
-                const tokenFeesOwedB = BigInt(pos.tokenFeesOwedB?.toString() || '0');
+                // Compute real uncollected fees using PositionUtils
+                // (on-chain tokenFeesOwedA/B is always 0 until position is poked)
+                let tokenFeesOwedA = BigInt(0);
+                let tokenFeesOwedB = BigInt(0);
+                const lowerTickState = tickMap.get(pos.tickLower);
+                const upperTickState = tickMap.get(pos.tickUpper);
+
+                if (lowerTickState && upperTickState) {
+                    try {
+                        const fees = (PositionUtils as any).GetPositionFees(
+                            poolData.computePoolInfo,
+                            {
+                                feeGrowthInsideLastX64A: pos.feeGrowthInsideLastX64A,
+                                feeGrowthInsideLastX64B: pos.feeGrowthInsideLastX64B,
+                                tokenFeesOwedA: new BN(pos.tokenFeesOwedA?.toString() || '0'),
+                                tokenFeesOwedB: new BN(pos.tokenFeesOwedB?.toString() || '0'),
+                                liquidity,
+                            },
+                            lowerTickState,
+                            upperTickState,
+                        );
+                        tokenFeesOwedA = BigInt(fees.tokenFeeAmountA?.toString() || '0');
+                        tokenFeesOwedB = BigInt(fees.tokenFeeAmountB?.toString() || '0');
+                    } catch (feeErr) {
+                        log.warn({ event: 'fee_computation_error', error: String(feeErr) });
+                    }
+                }
 
                 log.debug({
                     event: 'calculated_position_amounts',

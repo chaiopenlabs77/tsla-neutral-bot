@@ -907,13 +907,18 @@ export class Orchestrator {
             });
 
             // Step 5: Calculate target token ratio for new range
+            // Use ALL wallet funds — hedge already has its own collateral, no need to reserve
             const { tokenARatio } = this.lpClient.calculateTokenRatio(config.RANGE_WIDTH_PERCENT);
             const totalLpValue = tslaxValueUsd + usdcValueUsd;
+            const targetTslaxUsd = totalLpValue * tokenARatio;
 
-            // Reserve hedge collateral (don't LP with all capital)
-            const hedgeCollateral = totalLpValue / (config.DEFAULT_LEVERAGE + 1) / config.DEFAULT_LEVERAGE;
-            const lpCapital = totalLpValue - hedgeCollateral;
-            const targetTslaxUsd = lpCapital * tokenARatio;
+            log.info({
+                event: 'reposition_compounding',
+                totalLpValue: totalLpValue.toFixed(2),
+                tslaxHeld: (Number(tslaxBalance) / 1e8).toFixed(8),
+                usdcHeld: usdcValueUsd.toFixed(2),
+                targetTslaxRatio: tokenARatio.toFixed(4),
+            });
 
             // Swap delta if needed (only swap the difference, not 50% of position)
             const tslaxDeltaUsd = targetTslaxUsd - tslaxValueUsd;

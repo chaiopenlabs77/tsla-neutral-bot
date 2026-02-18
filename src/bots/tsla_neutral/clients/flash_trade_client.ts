@@ -581,6 +581,22 @@ export class FlashTradeClient {
                 });
             }
 
+            // Fetch custody's current cumulative lock fee to compute actual funding income
+            let currentCumLockFee = 0;
+            try {
+                const custody = this.poolConfig.custodies.find(
+                    (c: any) => c.symbol === this.targetSymbol
+                );
+                if (custody) {
+                    const custodyAccount = await this.perpClient.program.account.custody.fetch(
+                        custody.custodyAccount
+                    );
+                    currentCumLockFee = Number((custodyAccount as any).borrowRateState?.cumulativeLockFee || 0) / 1e9;
+                }
+            } catch (err) {
+                log.warn({ event: 'custody_lock_fee_fetch_error', error: String(err) });
+            }
+
             const hedgePositions: HedgePosition[] = positions.map((pos: any) => {
                 const data = pos.account;
                 const side = data.side?.long ? 'LONG' : 'SHORT';
@@ -607,15 +623,20 @@ export class FlashTradeClient {
                 });
 
                 // Extract funding/fee fields from raw position data
-                const unsettledFeesUsd = Number(data.unsettledFeesUsd || 0) / 1e6;
                 const cumulativeLockFeeSnapshot = Number(data.cumulativeLockFeeSnapshot || 0) / 1e9;
+                // Compute actual funding income: (currentCumLockFee - positionSnapshot) * positionSize
+                // For SHORTS this is income (longs pay shorts), for LONGS this is cost
+                const fundingAccumulated = currentCumLockFee > 0 && cumulativeLockFeeSnapshot > 0
+                    ? (currentCumLockFee - cumulativeLockFeeSnapshot) * size
+                    : 0;
+                const unsettledFeesUsd = fundingAccumulated;
 
-                log.debug({
+                log.info({
                     event: 'flash_funding_fields',
-                    unsettledFeesUsd,
+                    fundingIncome: unsettledFeesUsd.toFixed(6),
                     cumulativeLockFeeSnapshot,
-                    rawUnsettledFees: data.unsettledFeesUsd?.toString(),
-                    rawCumulativeLockFee: data.cumulativeLockFeeSnapshot?.toString(),
+                    currentCumLockFee,
+                    positionSize: size,
                 });
 
                 // Calculate liquidation price from position data

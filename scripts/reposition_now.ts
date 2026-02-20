@@ -175,10 +175,9 @@ async function main() {
     // Step 4: Open new LP at current price with ±1% range
     console.log(`\n--- OPENING NEW LP at ±${(rangePercent * 100).toFixed(1)}% ---`);
     const openResult = await lpClient.openPosition(
-        currentPrice,
-        rangePercent,
         tslaxBalance,
         usdcBalance,
+        rangePercent,
     );
 
     if (!openResult) {

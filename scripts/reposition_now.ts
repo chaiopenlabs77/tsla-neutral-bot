@@ -43,7 +43,7 @@ async function main() {
     const pythClient = new PythClient();
 
     // Get current price from Pyth
-    const priceData = await pythClient.getPrice();
+    const priceData = await pythClient.getTSLAPrice();
     if (!priceData || !priceData.price) throw new Error('Pyth price unavailable — too late after market close?');
     const currentPrice = priceData.price;
     const priceAge = Date.now() - (priceData.publishTime * 1000);

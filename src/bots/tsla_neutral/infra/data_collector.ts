@@ -40,6 +40,13 @@ export interface CycleData {
     // Phase 5: Per-cycle deltas (for daily/hourly aggregation)
     hedgeFundingDeltaUsd?: number;  // Per-cycle funding increment
     lpFeesDeltaUsd?: number;        // Per-cycle LP fee increment
+    // Phase 6: Impermanent loss tracking
+    repositionIlUsd?: number;      // IL realized at this reposition event (0 on non-reposition cycles)
+    cumulativeIlUsd?: number;      // Running total of IL since strategy start
+    // Phase 6 (continued): Swap slippage tracking
+    swapSlippageBps?: number;      // Realized slippage on reposition swap (0 on non-swap cycles)
+    swapExpectedUsd?: number;      // Expected swap output in USD
+    swapActualUsd?: number;        // Actual swap output in USD
 }
 
 // ============================================================================
@@ -118,6 +125,21 @@ export class DataCollector {
             if (!colNames.has('lp_fees_delta_usd')) {
                 this.db.exec('ALTER TABLE cycles ADD COLUMN lp_fees_delta_usd REAL DEFAULT 0');
             }
+            if (!colNames.has('reposition_il_usd')) {
+                this.db.exec('ALTER TABLE cycles ADD COLUMN reposition_il_usd REAL DEFAULT 0');
+            }
+            if (!colNames.has('cumulative_il_usd')) {
+                this.db.exec('ALTER TABLE cycles ADD COLUMN cumulative_il_usd REAL DEFAULT 0');
+            }
+            if (!colNames.has('swap_slippage_bps')) {
+                this.db.exec('ALTER TABLE cycles ADD COLUMN swap_slippage_bps REAL DEFAULT 0');
+            }
+            if (!colNames.has('swap_expected_usd')) {
+                this.db.exec('ALTER TABLE cycles ADD COLUMN swap_expected_usd REAL DEFAULT 0');
+            }
+            if (!colNames.has('swap_actual_usd')) {
+                this.db.exec('ALTER TABLE cycles ADD COLUMN swap_actual_usd REAL DEFAULT 0');
+            }
 
             log.info({ event: 'data_collector_initialized', dbPath: this.dbPath });
         } catch (error) {
@@ -143,8 +165,10 @@ export class DataCollector {
                     rebalance_reason, rebalance_size_usd, gas_cost_usd,
                     est_funding_cost_usd, rebalance_slippage_cost_usd, reposition_event,
                     lp_fees_usd, lp_value_usd, hedge_funding_usd, hedge_cum_lock_fee,
-                    hedge_funding_delta_usd, lp_fees_delta_usd
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    hedge_funding_delta_usd, lp_fees_delta_usd,
+                    reposition_il_usd, cumulative_il_usd,
+                    swap_slippage_bps, swap_expected_usd, swap_actual_usd
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             `);
 
             stmt.run(
@@ -168,7 +192,12 @@ export class DataCollector {
                 data.hedgeFundingUsd || 0,
                 data.hedgeCumLockFee || 0,
                 data.hedgeFundingDeltaUsd || 0,
-                data.lpFeesDeltaUsd || 0
+                data.lpFeesDeltaUsd || 0,
+                data.repositionIlUsd || 0,
+                data.cumulativeIlUsd || 0,
+                data.swapSlippageBps || 0,
+                data.swapExpectedUsd || 0,
+                data.swapActualUsd || 0
             );
 
             log.debug({ event: 'cycle_recorded', timestamp: data.timestamp });

@@ -66,6 +66,18 @@ src/bots/tsla_neutral/
 - **Short leg**: Perpetual short on Flash Trade (TSLAr/USDC)
 - **Goal**: Delta-neutral yield from LP fees + funding income
 
+### Impermanent Loss (IL) in Delta-Hedged CLMM
+- IL is the **primary cost** of the delta-neutral strategy — directional moves cancel, IL remains
+- For concentrated LP at center P₀ with range width w, hedged with short:
+  - **In range** (r = P₁/P₀ between 1-w and 1+w): `il = -(2√r - r - 1) / w` as fraction of LP value
+  - **Out of range**: IL frozen at edge + tracking error `|r - r_edge| / 2` from unhedged exposure
+- IL is **realized at each reposition** (LP close locks it in)
+- Both fees AND IL scale with concentration factor — narrower range amplifies both equally
+- Tighter range = more repositions × smaller IL each, wider = fewer × larger IL each
+- ±1% range: ~0.25% of LP value per reposition (at edge move)
+- ±2% range: ~0.50% of LP value per reposition (at edge move)
+- **The hedge does NOT eliminate IL** — it only cancels directional risk. IL is the gamma cost.
+
 ## Critical Rules
 
 ### Funding Rate is INCOME, Not Cost
@@ -150,6 +162,11 @@ The `data_collector.ts` records every 10s cycle to SQLite. Schema auto-migrates 
 | hedge_cum_lock_fee | REAL | Flash Trade cumulativeLockFeeSnapshot (raw on-chain value) |
 | hedge_funding_delta_usd | REAL | Per-cycle funding increment (use `SUM()` for daily totals) |
 | lp_fees_delta_usd | REAL | Per-cycle LP fee increment (use `SUM()` for daily totals) |
+| reposition_il_usd | REAL | IL realized at this reposition event (0 on non-reposition cycles) |
+| cumulative_il_usd | REAL | Running total of IL since strategy start |
+| swap_slippage_bps | REAL | Realized slippage on reposition swap (0 on non-swap cycles) |
+| swap_expected_usd | REAL | Expected swap output in USD (from Jupiter quote) |
+| swap_actual_usd | REAL | Actual swap output in USD (from on-chain balance diff) |
 
 ### Data Analysis Gotchas
 - **First 5 days (pre-Jan 26)** have 0% APR — tracking wasn't deployed yet, filter these out
@@ -270,6 +287,15 @@ The bot was making ~360 wasted RPC calls/hour after market close (Pyth fetch + S
 ### 17. Distinguish cumulative vs per-cycle values in cycle data
 `hedge_funding_usd` and `lp_fees_usd` are **cumulative since position open** (or last reposition for LP fees). Recording $0.39 cumulative on every 10s cycle makes it look like $0.39/cycle = $3,369/day on a $2.34 short (144,000% APY — obviously wrong). The actual daily growth was $0.000056. Fix: Added `hedge_funding_delta_usd` and `lp_fees_delta_usd` columns that track the per-cycle increment. Use `SUM(delta)` for daily totals. The cumulative columns are still useful — they're monotonically increasing and robust against rounding errors.
 
+### 18. Impermanent loss is the dominant cost in delta-neutral CLMM — always model it
+The backtest originally showed ±1% at 495% APY and ±2% at 151% APY — but these numbers excluded impermanent loss entirely. With IL: ±1% drops to 44% APY, ±2% drops to -3.4% APY (a loss!). IL consumed 69% of ±1% gross fees and 99% of ±2% gross fees. For a delta-hedged LP, directional price moves cancel (that's the hedge), but IL remains as the residual gamma cost. When out of range, tracking error from unmatched hedge exposure adds to IL. Formula: `il_fraction = -(2√r - r - 1) / w` where r = price_ratio, w = range_width. When out of range, add `|r - r_edge|/2`. At ±1%, average IL per reposition was $26 (0.38% of LP value), not the theoretical $17 at edge — because price often moves beyond the edge before repositioning completes. Always model IL before making range width decisions.
+
+### 19. Always stress-test with zero/negative funding and 2x slippage
+The backtest's headline 44% APY at ±1% assumes 6bps/day funding income and 30bps slippage. But funding rates can flip negative in bear markets (shorts pay instead of earn), and slippage doubles during high-vol events. Stress scenarios: zero funding = 28.3% APY (still profitable!); negative funding (-3bps/day) = 21.1% APY; double slippage (60bps) = 0.6% APY (barely break-even); full stress (0 fund + 60bps + $1 gas) = -12.9% APY (loss). Key finding: ±1% is profitable even with zero funding — fee income alone covers IL. The biggest risk is slippage, not funding. ±0.5% survives full stress at 103% APY. Real-time IL tracking via `reposition_il_usd` and `cumulative_il_usd` in cycles.db computes actual IL vs fee income per day.
+
+### 20. Jupiter swap `outAmount` is an estimate — always measure actual token received
+The convenience methods (`swapUsdcToTslax`, etc.) returned `quote.outAmount` as the output amount, but this is the pre-execution estimate from the route planner. The actual on-chain amount differs due to price movement between quote and execution, MEV/sandwich attacks, and route execution variance. Fix: Query output token ATA balance before and after `confirmTransaction`, compute `actualOutput = postBalance - preBalance`. This also means downstream code using the swap result (like `tslaxBalance += BigInt(swapResult.tslaxAmount)` in repositionLP) now uses real amounts instead of estimates. Track `swap_slippage_bps` in cycles.db to monitor if slippage exceeds the 30bps assumption used in the backtest. For TSLAx output (8 decimals), convert to USD via `amount / 1e8 * currentPrice`. For USDC output (6 decimals), convert via `amount / 1e6`. Token-2022 (TSLAx) requires `TOKEN_2022_PROGRAM_ID` for ATA resolution.
+
 ## Working Protocol
 
 - **Plan first, execute after approval** — propose approach before making changes
@@ -286,7 +312,7 @@ The bot was making ~360 wasted RPC calls/hour after market close (Pyth fetch + S
 Secrets live in `.env` on the VM (never commit). Key vars:
 - `SOLANA_RPC_URL` — Helius/Triton RPC endpoint
 - `WALLET_PRIVATE_KEY` — Bot wallet (base58)
-- `RANGE_WIDTH_PERCENT` — LP range width (0.02 = ±2%)
+- `RANGE_WIDTH_PERCENT` — LP range width (0.01 = ±1%, deployed Feb 2026)
 - `DELTA_DRIFT_THRESHOLD_PERCENT` — Drift before rebalance (0.50 = 50%)
 - `MIN_REBALANCE_INTERVAL_MS` — Cooldown between rebalances (1800000 = 30min)
 - `AUTO_BOOTSTRAP` — Auto-create positions on startup (true/false)

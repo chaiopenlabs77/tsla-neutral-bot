@@ -25,6 +25,34 @@ import bs58 from 'bs58';
 
 const log = loggers.orchestrator;
 
+// Half of capital goes to LP, half to hedge collateral
+const LP_FRACTION = 0.5;
+
+/**
+ * Compute the realized cost (IL + tracking error) of a delta-hedged LP reposition.
+ * Returns loss as a POSITIVE fraction of LP value.
+ *
+ * For delta-hedged concentrated LP, directional moves cancel via the hedge.
+ * What remains is the gamma cost (IL) from the LP acting as market maker.
+ * When out of range, the LP freezes (delta=0) but hedge is still short → tracking error.
+ */
+function computeRepositionCost(priceRatio: number, rangePercent: number): number {
+    const r = priceRatio;
+    const w = rangePercent;
+
+    if (r >= 1 - w && r <= 1 + w) {
+        // In range: pure concentrated IL (gamma cost)
+        return -(2 * Math.sqrt(r) - r - 1) / w;
+    }
+
+    // Out of range: IL frozen at range edge + tracking error from unhedged exposure
+    const rEdge = r > 1 ? 1 + w : 1 - w;
+    const edgeIL = -(2 * Math.sqrt(rEdge) - rEdge - 1) / w;
+    const trackingError = Math.abs(r - rEdge) / 2;
+
+    return edgeIL + trackingError;
+}
+
 export class Orchestrator {
     private state: StateMachineState | null = null;
     private isRunning = false;
@@ -44,6 +72,15 @@ export class Orchestrator {
     // Previous cycle's cumulative values for delta computation
     private previousHedgeFunding = 0;
     private previousLpFees = 0;
+
+    // Impermanent loss tracking
+    private cumulativeIlUsd = 0;
+    private lastRepositionIlUsd = 0;  // Set at reposition, reset each cycle start
+
+    // Swap slippage tracking
+    private lastSwapSlippageBps = 0;
+    private lastSwapExpectedUsd = 0;
+    private lastSwapActualUsd = 0;
 
     // (EOD unwind removed — LP + hedge stay open 24/7)
 
@@ -274,6 +311,12 @@ export class Orchestrator {
 
         // ===== LIVE MODE: Fetch real on-chain data =====
 
+        // Reset per-cycle tracking (set only during reposition events)
+        this.lastRepositionIlUsd = 0;
+        this.lastSwapSlippageBps = 0;
+        this.lastSwapExpectedUsd = 0;
+        this.lastSwapActualUsd = 0;
+
         // Skip expensive network calls when US stock market is closed
         // (Pyth TSLA feed only publishes during NYSE hours — will always be stale otherwise)
         if (!isUSMarketOpen()) {
@@ -446,6 +489,31 @@ export class Orchestrator {
                         log.info({ event: 'reposition_deferred', reason: 'price_unstable' });
                         success = false; // Don't count as failure — just wait
                     } else {
+                        // Compute impermanent loss before closing the LP
+                        if (lpPositions.length > 0) {
+                            const pos = lpPositions[0];
+                            const midTick = (pos.lowerTick + pos.upperTick) / 2;
+                            const centerPrice = Math.pow(1.0001, midTick) * 100; // ×100 for 8-6 decimal diff
+                            const priceRatio = tslaPrice / centerPrice;
+                            const ilFraction = computeRepositionCost(priceRatio, config.RANGE_WIDTH_PERCENT);
+                            const lpValue = lpPositions.reduce((sum, p) => {
+                                const tokenA = Number(p.tokenAAmount) / 1e8;
+                                const tokenB = Number(p.tokenBAmount) / 1e6;
+                                return sum + tokenA * tslaPrice + tokenB;
+                            }, 0);
+                            this.lastRepositionIlUsd = ilFraction * lpValue;
+                            this.cumulativeIlUsd += this.lastRepositionIlUsd;
+                            log.info({
+                                event: 'reposition_il_computed',
+                                centerPrice: centerPrice.toFixed(2),
+                                currentPrice: tslaPrice.toFixed(2),
+                                priceRatio: priceRatio.toFixed(4),
+                                ilFraction: (ilFraction * 100).toFixed(3) + '%',
+                                ilUsd: this.lastRepositionIlUsd.toFixed(2),
+                                cumulativeIlUsd: this.cumulativeIlUsd.toFixed(2),
+                            });
+                        }
+
                         success = await this.repositionLP(tslaPrice);
 
                         if (success) {
@@ -620,6 +688,11 @@ export class Orchestrator {
             hedgeCumLockFee,
             hedgeFundingDeltaUsd: hedgeFundingDelta,
             lpFeesDeltaUsd: lpFeesDelta,
+            repositionIlUsd: this.lastRepositionIlUsd,
+            cumulativeIlUsd: this.cumulativeIlUsd,
+            swapSlippageBps: this.lastSwapSlippageBps,
+            swapExpectedUsd: this.lastSwapExpectedUsd,
+            swapActualUsd: this.lastSwapActualUsd,
         });
 
         this.state = await recordSuccess(this.state);
@@ -959,6 +1032,19 @@ export class Orchestrator {
                     return false;
                 }
                 tslaxBalance += BigInt(swapResult.tslaxAmount);
+
+                // Track swap slippage for cycle data
+                this.lastSwapSlippageBps = swapResult.slippageBps;
+                this.lastSwapExpectedUsd = Number(swapResult.expectedOutput) / 1e8 * currentPrice; // TSLAx output → USD
+                this.lastSwapActualUsd = Number(swapResult.actualOutput) / 1e8 * currentPrice;
+                log.info({
+                    event: 'reposition_swap_slippage',
+                    direction: 'USDC→TSLAx',
+                    expectedOutput: swapResult.expectedOutput,
+                    actualOutput: swapResult.actualOutput,
+                    slippageBps: swapResult.slippageBps,
+                    priceImpactPct: swapResult.priceImpactPct,
+                });
             } else if (tslaxDeltaUsd < -1) {
                 // Have excess TSLAx — swap some back
                 const excessTslax = BigInt(Math.floor((-tslaxDeltaUsd / currentPrice) * 1e8));
@@ -966,6 +1052,19 @@ export class Orchestrator {
                 if (!swapResult) {
                     log.warn({ event: 'reposition_swap_failed', direction: 'tslax_to_usdc' });
                     // Non-fatal: just open with current balance
+                } else {
+                    // Track swap slippage for cycle data
+                    this.lastSwapSlippageBps = swapResult.slippageBps;
+                    this.lastSwapExpectedUsd = Number(swapResult.expectedOutput) / 1e6; // USDC output → USD
+                    this.lastSwapActualUsd = Number(swapResult.actualOutput) / 1e6;
+                    log.info({
+                        event: 'reposition_swap_slippage',
+                        direction: 'TSLAx→USDC',
+                        expectedOutput: swapResult.expectedOutput,
+                        actualOutput: swapResult.actualOutput,
+                        slippageBps: swapResult.slippageBps,
+                        priceImpactPct: swapResult.priceImpactPct,
+                    });
                 }
             }
 

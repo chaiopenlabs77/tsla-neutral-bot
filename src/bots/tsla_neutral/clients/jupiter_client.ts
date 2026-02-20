@@ -62,6 +62,15 @@ interface JupiterSwapResponse {
   lastValidBlockHeight: number;
 }
 
+// Enriched swap result with actual vs expected output for slippage measurement
+export interface SwapResult {
+  txSignature: string;
+  expectedOutput: string;       // quote.outAmount (native units, pre-execution estimate)
+  actualOutput: string;         // post_balance - pre_balance (native units, on-chain confirmed)
+  slippageBps: number;          // (expected - actual) / expected * 10000 (positive = worse than expected)
+  priceImpactPct: string;       // from quote (pre-execution estimate)
+}
+
 /**
  * Jupiter Swap Client
  *
@@ -138,9 +147,36 @@ export class JupiterClient {
   }
 
   /**
-   * Execute a swap using a quote.
+   * Query token balance for a given mint. Returns balance in native units (bigint).
+   * For SOL, uses getBalance. For SPL tokens, uses getTokenAccountBalance.
    */
-  async swap(quote: JupiterQuote): Promise<{ txSignature: string } | null> {
+  private async getTokenBalance(mint: string): Promise<bigint> {
+    if (!this.wallet) return 0n;
+    try {
+      if (mint === TOKEN_MINTS.SOL) {
+        const balance = await this.connection.getBalance(this.wallet.publicKey);
+        return BigInt(balance);
+      }
+      const { getAssociatedTokenAddress, TOKEN_2022_PROGRAM_ID } = await import('@solana/spl-token');
+      // TSLAx uses Token-2022 program
+      const isTslax = mint === TOKEN_MINTS.TSLAX;
+      const ata = await getAssociatedTokenAddress(
+        new PublicKey(mint),
+        this.wallet.publicKey,
+        false,
+        isTslax ? TOKEN_2022_PROGRAM_ID : undefined,
+      );
+      const info = await this.connection.getTokenAccountBalance(ata);
+      return BigInt(info.value.amount);
+    } catch {
+      return 0n; // ATA doesn't exist yet — first swap will create it
+    }
+  }
+
+  /**
+   * Execute a swap using a quote. Measures actual output vs expected for slippage tracking.
+   */
+  async swap(quote: JupiterQuote): Promise<SwapResult | null> {
     this.ensureInitialized();
 
     log.info({
@@ -157,10 +193,19 @@ export class JupiterClient {
         msg: `Would swap ${quote.inAmount} ${quote.inputMint} → ${quote.outAmount} ${quote.outputMint}`,
       });
       txSubmittedCounter.inc({ type: 'swap', status: 'dry_run' });
-      return { txSignature: 'dry-run-signature' };
+      return {
+        txSignature: 'dry-run-signature',
+        expectedOutput: quote.outAmount,
+        actualOutput: quote.outAmount,
+        slippageBps: 0,
+        priceImpactPct: quote.priceImpactPct || '0',
+      };
     }
 
     try {
+      // Measure output token balance BEFORE swap
+      const preBalance = await this.getTokenBalance(quote.outputMint);
+
       // Strip platformFee from quote if present - it requires a feeAccount we don't have
       const cleanQuote = { ...quote } as Record<string, unknown>;
       delete cleanQuote.platformFee;
@@ -204,10 +249,34 @@ export class JupiterClient {
         lastValidBlockHeight,
       });
 
-      log.info({ event: 'jupiter_swap_success', txSignature: signature });
+      // Measure output token balance AFTER swap
+      const postBalance = await this.getTokenBalance(quote.outputMint);
+      const actualOutput = postBalance - preBalance;
+      const expectedOutput = BigInt(quote.outAmount);
+
+      // Compute realized slippage (positive = worse than expected)
+      let slippageBps = 0;
+      if (expectedOutput > 0n) {
+        slippageBps = Number((expectedOutput - actualOutput) * 10000n / expectedOutput);
+      }
+
+      log.info({
+        event: 'jupiter_swap_success',
+        txSignature: signature,
+        expectedOutput: expectedOutput.toString(),
+        actualOutput: actualOutput.toString(),
+        slippageBps,
+        priceImpactPct: quote.priceImpactPct,
+      });
       txSubmittedCounter.inc({ type: 'swap', status: 'success' });
 
-      return { txSignature: signature };
+      return {
+        txSignature: signature,
+        expectedOutput: expectedOutput.toString(),
+        actualOutput: actualOutput.toString(),
+        slippageBps,
+        priceImpactPct: quote.priceImpactPct || '0',
+      };
     } catch (error) {
       log.error({
         event: 'jupiter_swap_error',
@@ -224,11 +293,11 @@ export class JupiterClient {
   async swapSolToUsdc(
     solAmount: bigint,
     slippageBps?: number
-  ): Promise<{ txSignature: string; usdcAmount: string } | null> {
+  ): Promise<(SwapResult & { usdcAmount: string }) | null> {
     const quote = await this.getQuote(TOKEN_MINTS.SOL, TOKEN_MINTS.USDC, solAmount, slippageBps);
     const result = await this.swap(quote);
     if (result) {
-      return { ...result, usdcAmount: quote.outAmount };
+      return { ...result, usdcAmount: result.actualOutput };
     }
     return null;
   }
@@ -239,11 +308,11 @@ export class JupiterClient {
   async swapUsdcToSol(
     usdcAmount: bigint,
     slippageBps?: number
-  ): Promise<{ txSignature: string; solAmount: string } | null> {
+  ): Promise<(SwapResult & { solAmount: string }) | null> {
     const quote = await this.getQuote(TOKEN_MINTS.USDC, TOKEN_MINTS.SOL, usdcAmount, slippageBps);
     const result = await this.swap(quote);
     if (result) {
-      return { ...result, solAmount: quote.outAmount };
+      return { ...result, solAmount: result.actualOutput };
     }
     return null;
   }
@@ -254,7 +323,7 @@ export class JupiterClient {
   async swapUsdcToTslax(
     usdcAmount: bigint,
     slippageBps?: number
-  ): Promise<{ txSignature: string; tslaxAmount: string } | null> {
+  ): Promise<(SwapResult & { tslaxAmount: string }) | null> {
     const quote = await this.getQuote(TOKEN_MINTS.USDC, TOKEN_MINTS.TSLAX, usdcAmount, slippageBps);
 
     // Check price impact before executing large swaps
@@ -273,7 +342,7 @@ export class JupiterClient {
 
     const result = await this.swap(quote);
     if (result) {
-      return { ...result, tslaxAmount: quote.outAmount };
+      return { ...result, tslaxAmount: result.actualOutput };
     }
     return null;
   }
@@ -284,7 +353,7 @@ export class JupiterClient {
   async swapTslaxToUsdc(
     tslaxAmount: bigint,
     slippageBps?: number
-  ): Promise<{ txSignature: string; usdcAmount: string } | null> {
+  ): Promise<(SwapResult & { usdcAmount: string }) | null> {
     const quote = await this.getQuote(TOKEN_MINTS.TSLAX, TOKEN_MINTS.USDC, tslaxAmount, slippageBps);
 
     // Check price impact before executing large swaps
@@ -303,7 +372,7 @@ export class JupiterClient {
 
     const result = await this.swap(quote);
     if (result) {
-      return { ...result, usdcAmount: quote.outAmount };
+      return { ...result, usdcAmount: result.actualOutput };
     }
     return null;
   }

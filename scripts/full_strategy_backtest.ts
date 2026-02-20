@@ -112,6 +112,40 @@ function getRealConcentration(rangePercent: number): number {
     return 1.0;
 }
 
+// Half of capital goes to LP, half to hedge collateral
+const LP_FRACTION = 0.5;
+
+/**
+ * Compute the realized cost (IL + tracking error) of a delta-hedged LP reposition.
+ * Returns loss as a POSITIVE fraction of LP value.
+ *
+ * For delta-hedged concentrated LP, directional moves cancel via the hedge.
+ * What remains is the gamma cost (IL) from the LP acting as market maker.
+ * When out of range, the LP freezes (delta=0) but hedge is still short → tracking error.
+ *
+ * Formula derivation:
+ *   V_LP(P₁) - V_hold(P₁) + hedge_PnL = L×√P₀×(2√r - r - 1)
+ *   As fraction of LP value (V₀ ≈ L×√P₀×w): (2√r - r - 1) / w
+ *   where r = P₁/P₀ (price ratio), w = rangePercent
+ */
+function computeRepositionCost(priceRatio: number, rangePercent: number): number {
+    const r = priceRatio;
+    const w = rangePercent;
+
+    if (r >= 1 - w && r <= 1 + w) {
+        // In range: pure concentrated IL (gamma cost)
+        return -(2 * Math.sqrt(r) - r - 1) / w;
+    }
+
+    // Out of range: IL frozen at range edge + tracking error from unhedged exposure.
+    // LP delta = 0 when out of range, but hedge is still short → net short exposure.
+    const rEdge = r > 1 ? 1 + w : 1 - w;
+    const edgeIL = -(2 * Math.sqrt(rEdge) - rEdge - 1) / w;
+    const trackingError = Math.abs(r - rEdge) / 2;
+
+    return edgeIL + trackingError;
+}
+
 const DEFAULT_CONFIG: StrategyConfig = {
     rangePercent: 0.02,             // ±2% (current deployed)
     positionSizeUsd: 14000,
@@ -138,6 +172,7 @@ interface SimResult {
     repositionsDeferred: number;    // Deferred due to price instability
     cooldownSkips: number;          // Skipped due to cooldown
     grossFeesUsd: number;
+    ilCostUsd: number;              // Total impermanent loss realized at repositions
     repoSlippageCostUsd: number;
     gasUsd: number;
     fundingIncomeUsd: number;
@@ -181,6 +216,7 @@ function simulate(data: CycleRow[], cfg: StrategyConfig): SimResult {
     let repositionsDeferred = 0;
     let cooldownSkips = 0;
     let totalGrossFees = 0;
+    let totalIL = 0;
     let totalRepoSlippage = 0;
     let totalGas = 0;
     let totalFunding = 0;
@@ -279,6 +315,14 @@ function simulate(data: CycleRow[], cfg: StrategyConfig): SimResult {
                     // REPOSITION
                     dayRepos++;
 
+                    // Impermanent loss: realized when closing LP at a different price than center
+                    // For delta-hedged LP, directional moves cancel — IL is the residual gamma cost
+                    const priceRatio = point.tslaPrice / rangeCenter;
+                    const ilFraction = computeRepositionCost(priceRatio, cfg.rangePercent);
+                    const ilCost = ilFraction * position * LP_FRACTION;
+                    totalIL += ilCost;
+                    position -= ilCost;
+
                     // Cost: swap only the ratio delta (not 50%)
                     const repoSlippage = cfg.swapPortionOnReposition * position * (cfg.lpSlippageBps / 10000);
                     totalRepoSlippage += repoSlippage;
@@ -333,6 +377,7 @@ function simulate(data: CycleRow[], cfg: StrategyConfig): SimResult {
         repositionsDeferred,
         cooldownSkips,
         grossFeesUsd: totalGrossFees,
+        ilCostUsd: totalIL,
         repoSlippageCostUsd: totalRepoSlippage,
         gasUsd: totalGas,
         fundingIncomeUsd: totalFunding,
@@ -378,6 +423,13 @@ const SCENARIOS: Scenario[] = [
     // ── Funding sensitivity ─────────────────────────────────────────────────
     { name: '±2% 0 FUND', overrides: { dailyFundingRate: 0 }, description: 'No funding income' },
     { name: '±2% 0.1%/d', overrides: { dailyFundingRate: 0.001 }, description: 'High funding income' },
+
+    // ── Bear market / stress scenarios ────────────────────────────────────
+    { name: '±1% 0 FUND', overrides: { rangePercent: 0.01, dailyFundingRate: 0 }, description: 'No funding income at ±1%' },
+    { name: '±1% NEG FUND', overrides: { rangePercent: 0.01, dailyFundingRate: -0.0003 }, description: 'Shorts pay 3bps/day (bear)' },
+    { name: '±1% 2x SLIP', overrides: { rangePercent: 0.01, lpSlippageBps: 60 }, description: 'Double slippage (stressed)' },
+    { name: '±1% STRESS', overrides: { rangePercent: 0.01, dailyFundingRate: 0, lpSlippageBps: 60, gasPerRepositionUsd: 1.00 }, description: 'Bear: 0 fund + 2x slip + 2x gas' },
+    { name: '±0.5% STRESS', overrides: { rangePercent: 0.005, dailyFundingRate: 0, lpSlippageBps: 60, gasPerRepositionUsd: 1.00 }, description: 'Ultra-tight stress test' },
 
     // ── Reference: old broken strategy ──────────────────────────────────────
     { name: 'OLD (no repo)', overrides: { rangePercent: 0.05, maxOutOfRangeMs: 999_999_999_999 }, description: 'Old: ±5%, never reposition' },
@@ -443,9 +495,9 @@ function main() {
     console.log('');
 
     // Run all scenarios
-    console.log('┌──────────────────┬────────┬────────┬────────┬─────────┬─────────┬────────┬─────────┬─────────┬─────────┬────────┐');
-    console.log('│ Scenario         │ In-Rng │ Repos  │ Defer  │ Gross$  │ Repo$   │ Fund+$ │ Gas$    │ Net P&L │ Net APY │ MaxDD  │');
-    console.log('├──────────────────┼────────┼────────┼────────┼─────────┼─────────┼────────┼─────────┼─────────┼─────────┼────────┤');
+    console.log('┌──────────────────┬────────┬────────┬────────┬─────────┬─────────┬─────────┬────────┬─────────┬─────────┬─────────┬────────┐');
+    console.log('│ Scenario         │ In-Rng │ Repos  │ Defer  │ Gross$  │ IL$     │ Repo$   │ Fund+$ │ Gas$    │ Net P&L │ Net APY │ MaxDD  │');
+    console.log('├──────────────────┼────────┼────────┼────────┼─────────┼─────────┼─────────┼────────┼─────────┼─────────┼─────────┼────────┤');
 
     const results: SimResult[] = [];
 
@@ -466,6 +518,7 @@ function main() {
             ` ${r.repositions.toString().padStart(5)}  │` +
             ` ${r.repositionsDeferred.toString().padStart(5)}  │` +
             ` $${r.grossFeesUsd.toFixed(0).padStart(6)} │` +
+            ` $${r.ilCostUsd.toFixed(0).padStart(6)} │` +
             ` $${r.repoSlippageCostUsd.toFixed(0).padStart(6)} │` +
             ` $${r.fundingIncomeUsd.toFixed(0).padStart(5)} │` +
             ` $${r.gasUsd.toFixed(0).padStart(6)} │` +
@@ -475,7 +528,7 @@ function main() {
         );
     }
 
-    console.log('└──────────────────┴────────┴────────┴────────┴─────────┴─────────┴────────┴─────────┴─────────┴─────────┴────────┘');
+    console.log('└──────────────────┴────────┴────────┴────────┴─────────┴─────────┴─────────┴────────┴─────────┴─────────┴─────────┴────────┘');
     console.log('★ = 50%+ APY | ◆ = 25%+ APY | ○ = 10%+ APY | · = Profitable | ✗ = Loss\n');
 
     // Find optimal
@@ -520,6 +573,7 @@ function main() {
         console.log(`│ Repos/day            │ ${r1pct.reposPerDay.toFixed(1).padStart(11)}   │ ${r2pct.reposPerDay.toFixed(1).padStart(13)}   │`);
         console.log(`│ Deferred (unstable)  │ ${r1pct.repositionsDeferred.toString().padStart(11)}   │ ${r2pct.repositionsDeferred.toString().padStart(13)}   │`);
         console.log(`│ Gross fees           │ $${r1pct.grossFeesUsd.toFixed(0).padStart(10)}   │ $${r2pct.grossFeesUsd.toFixed(0).padStart(12)}   │`);
+        console.log(`│ Impermanent loss     │ $${r1pct.ilCostUsd.toFixed(0).padStart(10)}   │ $${r2pct.ilCostUsd.toFixed(0).padStart(12)}   │`);
         console.log(`│ Funding income       │ $${r1pct.fundingIncomeUsd.toFixed(0).padStart(10)}   │ $${r2pct.fundingIncomeUsd.toFixed(0).padStart(12)}   │`);
         console.log(`│ Repo slippage        │ $${r1pct.repoSlippageCostUsd.toFixed(0).padStart(10)}   │ $${r2pct.repoSlippageCostUsd.toFixed(0).padStart(12)}   │`);
         console.log(`│ Gas cost             │ $${r1pct.gasUsd.toFixed(0).padStart(10)}   │ $${r2pct.gasUsd.toFixed(0).padStart(12)}   │`);
@@ -564,10 +618,48 @@ function main() {
         console.log('');
     }
 
+    // ── BEAR MARKET / STRESS SCENARIOS ───────────────────────────────────
+    const r1_0fund = results.find(r => r.config.rangePercent === 0.01 && r.config.dailyFundingRate === 0 && r.config.lpSlippageBps === 30);
+    const r1_negFund = results.find(r => r.config.rangePercent === 0.01 && r.config.dailyFundingRate === -0.0003);
+    const r1_2xSlip = results.find(r => r.config.rangePercent === 0.01 && r.config.lpSlippageBps === 60 && r.config.dailyFundingRate === 0.0006);
+    const r1_stress = results.find(r => r.config.rangePercent === 0.01 && r.config.dailyFundingRate === 0 && r.config.lpSlippageBps === 60);
+    const r05_stress = results.find(r => r.config.rangePercent === 0.005 && r.config.dailyFundingRate === 0 && r.config.lpSlippageBps === 60);
+
+    if (r1pct && r1_0fund && r1_negFund && r1_2xSlip && r1_stress) {
+        console.log('BEAR MARKET / STRESS SCENARIOS (±1%):');
+        console.log(`  Normal (current):          ${(r1pct.netApy * 100).toFixed(1)}% APY  | Net P&L: $${r1pct.netPnlUsd.toFixed(0)}`);
+        console.log(`  Zero funding:              ${(r1_0fund.netApy * 100).toFixed(1)}% APY  | Net P&L: $${r1_0fund.netPnlUsd.toFixed(0)}`);
+        console.log(`  Negative funding (-3bps):  ${(r1_negFund.netApy * 100).toFixed(1)}% APY  | Net P&L: $${r1_negFund.netPnlUsd.toFixed(0)}`);
+        console.log(`  Double slippage (60bps):   ${(r1_2xSlip.netApy * 100).toFixed(1)}% APY  | Net P&L: $${r1_2xSlip.netPnlUsd.toFixed(0)}`);
+        console.log(`  Full stress (all above):   ${(r1_stress.netApy * 100).toFixed(1)}% APY  | Net P&L: $${r1_stress.netPnlUsd.toFixed(0)}`);
+        if (r05_stress) {
+            console.log(`  ±0.5% stress:              ${(r05_stress.netApy * 100).toFixed(1)}% APY  | Net P&L: $${r05_stress.netPnlUsd.toFixed(0)}`);
+        }
+
+        // Identify breakeven funding rate at ±1% (linear interpolation)
+        if (r1_0fund.netApy < 0 && r1pct.netApy > 0) {
+            const breakeven = 0.0006 * (-r1_0fund.netApy) / (r1pct.netApy - r1_0fund.netApy);
+            console.log(`\n  Breakeven funding rate: ${(breakeven * 100).toFixed(3)}%/day (below this, ±1% loses money)`);
+        } else if (r1_0fund.netApy >= 0) {
+            console.log(`\n  ±1% is profitable EVEN with zero funding — fee income alone covers IL`);
+        }
+        console.log('');
+    }
+
     // ── FUNDING SENSITIVITY ────────────────────────────────────────────────
     const noFund = results.find(r => r.config.dailyFundingRate === 0 && r.config.rangePercent === 0.02);
     const highFund = results.find(r => r.config.dailyFundingRate === 0.001 && r.config.rangePercent === 0.02);
-    if (noFund && r2pct && highFund) {
+    if (r1pct && r1_0fund && r2pct && noFund) {
+        console.log('FUNDING INCOME SENSITIVITY:');
+        console.log('  ±1% range:');
+        console.log(`    0 bps/day:   ${(r1_0fund.netApy * 100).toFixed(1)}% APY`);
+        console.log(`    6 bps/day:   ${(r1pct.netApy * 100).toFixed(1)}% APY`);
+        console.log('  ±2% range:');
+        console.log(`    0 bps/day:   ${(noFund.netApy * 100).toFixed(1)}% APY`);
+        console.log(`    6 bps/day:   ${(r2pct.netApy * 100).toFixed(1)}% APY`);
+        if (highFund) console.log(`    10 bps/day:  ${(highFund.netApy * 100).toFixed(1)}% APY`);
+        console.log('');
+    } else if (noFund && r2pct && highFund) {
         console.log('FUNDING INCOME SENSITIVITY (±2%):');
         console.log(`  0 bps/day (no funding):   ${(noFund.netApy * 100).toFixed(1)}% APY`);
         console.log(`  6 bps/day (current):      ${(r2pct.netApy * 100).toFixed(1)}% APY`);
@@ -594,20 +686,41 @@ function main() {
     console.log('════════════════════════════════════════════════════════════════════════════════════════════════════\n');
 
     if (r1pct && r2pct) {
-        const switch1 = r1pct.netApy > r2pct.netApy * 1.5 &&
-                         r1pct.reposPerDay <= 3 &&
-                         r1pct.maxDrawdownPct <= 0.005;
-        if (switch1) {
-            console.log(`SWITCH TO ±1% — ${(r1pct.netApy * 100).toFixed(0)}% APY vs ${(r2pct.netApy * 100).toFixed(0)}% (${(r1pct.netApy / r2pct.netApy).toFixed(1)}x better)`);
-            console.log(`  ${r1pct.reposPerDay.toFixed(1)} repos/day is manageable, max DD ${(r1pct.maxDrawdownPct * 100).toFixed(2)}% is acceptable`);
-        } else if (r1pct.netApy > r2pct.netApy) {
-            console.log(`STAY AT ±2% — ±1% is only ${((r1pct.netApy / r2pct.netApy - 1) * 100).toFixed(0)}% better, not worth the added risk`);
-            if (r1pct.reposPerDay > 3) console.log(`  ±1% needs ${r1pct.reposPerDay.toFixed(1)} repos/day (>3, too much operational risk)`);
-            if (r1pct.maxDrawdownPct > 0.005) console.log(`  ±1% max DD ${(r1pct.maxDrawdownPct * 100).toFixed(2)}% exceeds 0.50% threshold`);
-        } else {
-            console.log(`STAY AT ±2% — it outperforms ±1% with this data (${(r2pct.netApy * 100).toFixed(0)}% vs ${(r1pct.netApy * 100).toFixed(0)}%)`);
+        // Rank all core scenarios by APY
+        const coreResults = results.filter(r =>
+            [0.005, 0.01, 0.015, 0.02, 0.03, 0.05, 0.10].includes(r.config.rangePercent) &&
+            r.config.priceStabilizationMaxMove === 0.005 &&
+            r.config.minRebalanceIntervalMs === 1_800_000 &&
+            r.config.dailyFundingRate === 0.0006 &&
+            r.config.lpSlippageBps === 30 &&
+            r.config.gasPerRepositionUsd === 0.50 &&
+            r.config.maxOutOfRangeMs < 999_999_999
+        );
+        coreResults.sort((a, b) => b.netApy - a.netApy);
+
+        console.log('RANGE WIDTH RANKING (by Net APY with IL):');
+        for (const cr of coreResults) {
+            const pct = (cr.config.rangePercent * 100).toFixed(1);
+            const status = cr.netApy > 0 ? 'PROFIT' : 'LOSS';
+            const ilPerRepo = cr.repositions > 0 ? (cr.ilCostUsd / cr.repositions).toFixed(0) : 'N/A';
+            console.log(`  ±${pct}%: ${(cr.netApy * 100).toFixed(1)}% APY (${status}) | Fees: $${cr.grossFeesUsd.toFixed(0)} - IL: $${cr.ilCostUsd.toFixed(0)} | IL/repo: $${ilPerRepo}`);
         }
-        console.log(`\nExpected: $${DEFAULT_CONFIG.positionSizeUsd} at ${(r2pct.netApy * 100).toFixed(0)}% APY = $${(DEFAULT_CONFIG.positionSizeUsd * r2pct.netApy * (parseFloat(totalDays) / 365)).toFixed(0)} over ${totalDays} days.`);
+
+        const bestCore = coreResults[0];
+        const bestPct = (bestCore.config.rangePercent * 100).toFixed(1);
+        console.log(`\nBEST RANGE: ±${bestPct}% at ${(bestCore.netApy * 100).toFixed(1)}% APY`);
+
+        if (r1pct.netApy > 0 && r2pct.netApy <= 0) {
+            console.log(`±1% is profitable (${(r1pct.netApy * 100).toFixed(0)}% APY), ±2% is losing money (${(r2pct.netApy * 100).toFixed(0)}% APY). ±1% is the clear winner.`);
+        } else if (r1pct.netApy > r2pct.netApy) {
+            const diff = ((r1pct.netApy - r2pct.netApy) * 100).toFixed(0);
+            console.log(`±1% beats ±2% by ${diff}pp APY (${(r1pct.netApy * 100).toFixed(0)}% vs ${(r2pct.netApy * 100).toFixed(0)}%)`);
+        } else {
+            console.log(`±2% beats ±1% (${(r2pct.netApy * 100).toFixed(0)}% vs ${(r1pct.netApy * 100).toFixed(0)}%)`);
+        }
+
+        console.log(`\nKey insight: IL is ${(r1pct.ilCostUsd / r1pct.grossFeesUsd * 100).toFixed(0)}% of gross fees at ±1%, ${(r2pct.ilCostUsd / r2pct.grossFeesUsd * 100).toFixed(0)}% at ±2%`);
+        console.log(`When IL ≥ fees, the strategy loses money regardless of other income.`);
     }
 }
 

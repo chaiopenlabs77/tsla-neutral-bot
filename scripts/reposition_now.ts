@@ -49,9 +49,12 @@ async function main() {
     const priceAge = Date.now() - (priceData.publishTime * 1000);
     console.log(`\nTSLA price: $${currentPrice.toFixed(2)} (age: ${(priceAge / 1000).toFixed(0)}s)`);
 
-    if (priceAge > 120_000) {
-        console.log('WARNING: Price is >2 min old. Pyth may be stale. Aborting.');
+    if (priceAge > 600_000) {
+        console.log('WARNING: Price is >10 min old. Pyth is stale. Aborting.');
         process.exit(1);
+    }
+    if (priceAge > 120_000) {
+        console.log('NOTE: Price is >2 min old — likely just after market close. Proceeding with closing price.');
     }
 
     // Fetch current LP positions

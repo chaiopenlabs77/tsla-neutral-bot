@@ -102,6 +102,7 @@ src/bots/tsla_neutral/
 - Flash Trade extended: 24/5 availability (Mon-Fri including pre/post market)
 - **LP repositioning** can happen anytime (on-chain only, no Flash Trade needed)
 - **Auto-bootstrap** only triggers during market hours (needs hedge leg)
+- **After-hours power saving**: When US stock market is closed, cycles skip all network calls and loop interval slows from 10s to 60s. Pyth TSLA feed only publishes during NYSE hours, so after-hours cycles would always fail the staleness check anyway. This saves ~360 wasted RPC calls/hour.
 
 ### Rebalance Parameters (Optimized Feb 2026)
 - `DELTA_DRIFT_THRESHOLD_PERCENT=0.50` — 50% drift before rebalance (was 5%, way too aggressive)
@@ -143,10 +144,12 @@ The `data_collector.ts` records every 10s cycle to SQLite. Schema auto-migrates 
 | est_funding_cost_usd | REAL | Estimated per-cycle funding (legacy name — is income for shorts) |
 | rebalance_slippage_cost_usd | REAL | Slippage on rebalance trades |
 | reposition_event | INTEGER | 1 if LP was repositioned |
-| lp_fees_usd | REAL | Uncollected LP fees in USD (tokenFeesOwedA × price + tokenFeesOwedB) |
+| lp_fees_usd | REAL | **CUMULATIVE** uncollected LP fees in USD (since last reposition) |
 | lp_value_usd | REAL | Total LP position value in USD |
-| hedge_funding_usd | REAL | Flash Trade unsettledFeesUsd (actual funding) |
-| hedge_cum_lock_fee | REAL | Flash Trade cumulativeLockFeeSnapshot |
+| hedge_funding_usd | REAL | **CUMULATIVE** funding income since position open (shorts earn this) |
+| hedge_cum_lock_fee | REAL | Flash Trade cumulativeLockFeeSnapshot (raw on-chain value) |
+| hedge_funding_delta_usd | REAL | Per-cycle funding increment (use `SUM()` for daily totals) |
+| lp_fees_delta_usd | REAL | Per-cycle LP fee increment (use `SUM()` for daily totals) |
 
 ### Data Analysis Gotchas
 - **First 5 days (pre-Jan 26)** have 0% APR — tracking wasn't deployed yet, filter these out
@@ -154,6 +157,10 @@ The `data_collector.ts` records every 10s cycle to SQLite. Schema auto-migrates 
 - **Off-hours fee estimation**: Use ~3% APR as conservative off-hours estimate
 - **Time gaps**: Median gap is 10s, but weekends create 65+ hour gaps
 - When analyzing: handle gaps >30s specially (split into on-hours actual APR + off-hours estimated APR)
+- **`hedge_funding_usd` and `lp_fees_usd` are CUMULATIVE** — they grow monotonically. The same ~$0.39 appears every cycle because it's total-since-open. Use `*_delta_usd` columns for per-cycle increments.
+- **Daily funding**: `SELECT SUM(hedge_funding_delta_usd) FROM cycles WHERE timestamp > <start_of_day>`
+- **Daily LP fees**: `SELECT SUM(lp_fees_delta_usd) FROM cycles WHERE timestamp > <start_of_day>`
+- **First cycle after restart** has delta=0 (no previous value to diff against) — this is correct, not missing data
 
 ## Recovery Flows
 
@@ -256,6 +263,12 @@ Recovery/fullReset had no max retry limit. A persistent failure (Flash Trade dow
 
 ### 15. Never hardcode asset prices — always fetch dynamically
 SOL price was hardcoded at `$200` for collateral swap calculations. If SOL dropped to $100, the bot would swap 2x the necessary amount. Fix: Use `jupiterClient.getPrice(SOL, USDC)` with $200 fallback.
+
+### 16. Don't burn RPC calls when data will always be stale
+The bot was making ~360 wasted RPC calls/hour after market close (Pyth fetch + SOL balance check every 10s), only to immediately bail on the Pyth staleness check. Fix: Early return from `runCycle()` when `!isUSMarketOpen()`, and slow the loop interval to 60s. During NYSE hours (9:30 AM - 4 PM ET) the full 10s cadence resumes.
+
+### 17. Distinguish cumulative vs per-cycle values in cycle data
+`hedge_funding_usd` and `lp_fees_usd` are **cumulative since position open** (or last reposition for LP fees). Recording $0.39 cumulative on every 10s cycle makes it look like $0.39/cycle = $3,369/day on a $2.34 short (144,000% APY — obviously wrong). The actual daily growth was $0.000056. Fix: Added `hedge_funding_delta_usd` and `lp_fees_delta_usd` columns that track the per-cycle increment. Use `SUM(delta)` for daily totals. The cumulative columns are still useful — they're monotonically increasing and robust against rounding errors.
 
 ## Working Protocol
 

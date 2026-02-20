@@ -41,6 +41,10 @@ export class Orchestrator {
     private recoveryAttempts = 0;
     private dataCollector: DataCollector;
 
+    // Previous cycle's cumulative values for delta computation
+    private previousHedgeFunding = 0;
+    private previousLpFees = 0;
+
     // (EOD unwind removed — LP + hedge stay open 24/7)
 
     // Pool APR cache (refresh every 5 minutes)
@@ -565,7 +569,7 @@ export class Orchestrator {
             }
         }
 
-        // Compute hedge funding fields
+        // Compute hedge funding fields (cumulative since position open)
         let hedgeFundingUsd = 0;
         let hedgeCumLockFee = 0;
         if (hedgePositions.length > 0) {
@@ -573,6 +577,26 @@ export class Orchestrator {
                 hedgeFundingUsd += pos.unsettledFeesUsd;
                 hedgeCumLockFee += pos.cumulativeLockFeeSnapshot;
             }
+        }
+
+        // Compute per-cycle deltas (skip first cycle after startup where previous = 0)
+        const hedgeFundingDelta = this.previousHedgeFunding > 0
+            ? Math.max(0, hedgeFundingUsd - this.previousHedgeFunding)
+            : 0;
+        const lpFeesDelta = this.previousLpFees > 0
+            ? Math.max(0, lpFeesUsd - this.previousLpFees)
+            : 0;
+        this.previousHedgeFunding = hedgeFundingUsd;
+        this.previousLpFees = lpFeesUsd;
+
+        if (hedgeFundingDelta > 0 || lpFeesDelta > 0) {
+            log.info({
+                event: 'fee_tracking',
+                lpFeesCumulative: lpFeesUsd.toFixed(6),
+                lpFeesDelta: lpFeesDelta.toFixed(8),
+                hedgeFundingCumulative: hedgeFundingUsd.toFixed(6),
+                hedgeFundingDelta: hedgeFundingDelta.toFixed(8),
+            });
         }
 
         this.dataCollector.recordCycle({
@@ -594,6 +618,8 @@ export class Orchestrator {
             lpValueUsd,
             hedgeFundingUsd,
             hedgeCumLockFee,
+            hedgeFundingDeltaUsd: hedgeFundingDelta,
+            lpFeesDeltaUsd: lpFeesDelta,
         });
 
         this.state = await recordSuccess(this.state);

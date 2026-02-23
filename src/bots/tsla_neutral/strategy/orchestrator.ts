@@ -593,21 +593,9 @@ export class Orchestrator {
             await this.fetchPoolApr();
         }
 
-        // Estimated daily funding cost (hedge notional × daily rate)
-        const hedgeNotional = Math.abs(hedgeDelta);
-        const estDailyFundingUsd = hedgeNotional * config.FUNDING_RATE_SPIKE_THRESHOLD;
-        if (estDailyFundingUsd > 0 && this.cachedPoolApr > 0) {
-            // Warn if funding cost exceeds 50% of gross fee income
-            const grossDailyFees = (hedgeNotional * (this.cachedPoolApr / 100)) / 365;
-            if (estDailyFundingUsd > grossDailyFees * 0.5) {
-                log.warn({
-                    event: 'funding_cost_high',
-                    estDailyFundingUsd: estDailyFundingUsd.toFixed(2),
-                    grossDailyFees: grossDailyFees.toFixed(2),
-                    ratio: (estDailyFundingUsd / grossDailyFees).toFixed(2),
-                });
-            }
-        }
+        // Per-cycle funding estimate (used for DB recording only — note: for shorts this is income, not cost)
+        const estDailyFundingUsd = Math.abs(hedgeDelta) * config.FUNDING_RATE_SPIKE_THRESHOLD;
+
 
         // Measure actual gas cost (SOL difference × rough price)
         let actualGasCostUsd = 0;

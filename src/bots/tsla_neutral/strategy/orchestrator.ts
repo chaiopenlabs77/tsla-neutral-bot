@@ -525,7 +525,7 @@ export class Orchestrator {
                                 for (const pos of newLpPositions) {
                                     newLpDelta += this.lpClient!.calculatePositionDelta(pos, tslaPrice);
                                 }
-                                if (newLpDelta > config.MIN_REBALANCE_SIZE_USD) {
+                                if (newLpDelta > 0) {
                                     log.info({ event: 'post_reposition_hedging', lpDelta: newLpDelta });
                                     await this.executeRebalance(newLpDelta, tslaPrice, []);
                                 }
@@ -712,21 +712,8 @@ export class Orchestrator {
             }
         }
 
-        const absSize = Math.abs(sizeToAdjust);
-
-        // Skip tiny adjustments
-        if (absSize < config.MIN_REBALANCE_SIZE_USD) {
-            log.info({
-                event: 'rebalance_skipped',
-                reason: 'below_min_size',
-                size: absSize,
-                minSize: config.MIN_REBALANCE_SIZE_USD
-            });
-            return true; // Not a failure, just skipped
-        }
-
-        // Cap position size
-        const cappedSize = Math.min(absSize, config.MAX_POSITION_SIZE_USD);
+        // Cap position size (min-size guard lives inside existingShort branch — applies to adjustments only, not initial opens)
+        const cappedSize = Math.min(Math.abs(sizeToAdjust), config.MAX_POSITION_SIZE_USD);
 
         // For opening new shorts, check if we have enough USDC for collateral
         if (sizeToAdjust > 0) {
@@ -800,6 +787,16 @@ export class Orchestrator {
                 const existingShort = existingPositions.find(p => p.side === 'SHORT');
 
                 if (existingShort) {
+                    // Skip tiny adjustments to existing position (not worth the fee)
+                    if (cappedSize < config.MIN_REBALANCE_SIZE_USD) {
+                        log.info({
+                            event: 'rebalance_skipped',
+                            reason: 'below_min_size',
+                            size: cappedSize,
+                            minSize: config.MIN_REBALANCE_SIZE_USD,
+                        });
+                        return true;
+                    }
                     // Existing position - use increaseSize
                     log.info({
                         event: 'increasing_short',

@@ -286,6 +286,23 @@ export class FlashTradeClient {
                 poolAddress: this.poolConfig?.poolAddress?.toBase58(),
             });
 
+            // Fetch fresh Pyth prices and create update instructions
+            // Required for Remora pool — oracle must be current or instruction is rejected with 6031
+            const flashSdk = await import('flash-sdk');
+            let pythUpdateInstructions: TransactionInstruction[] = [];
+            try {
+                const poolAddress = this.poolConfig.poolAddress?.toBase58();
+                log.info({ event: 'fetching_pyth_backup_oracle', poolAddress });
+                pythUpdateInstructions = await flashSdk.createBackupOracleInstruction(poolAddress, true);
+                log.info({ event: 'pyth_update_instructions_created', count: pythUpdateInstructions.length });
+            } catch (pythError) {
+                log.warn({
+                    event: 'pyth_backup_oracle_fetch_failed',
+                    error: pythError instanceof Error ? pythError.message : String(pythError),
+                    msg: 'Proceeding without Pyth update - may fail if oracle is stale',
+                });
+            }
+
             // Build open position instruction
             const { instructions, additionalSigners } = await this.perpClient.openPosition(
                 this.targetSymbol,
@@ -298,8 +315,9 @@ export class FlashTradeClient {
                 { none: {} } // Privilege
             );
 
-            // Build and send transaction
-            const txSignature = await this.buildAndSendTransaction(instructions, additionalSigners);
+            // Prepend Pyth update instructions before the open instruction
+            const allOpenInstructions = [...pythUpdateInstructions, ...instructions];
+            const txSignature = await this.buildAndSendTransaction(allOpenInstructions, additionalSigners);
 
             log.info({ event: 'short_position_opened', txSignature });
             txSubmittedCounter.inc({ type: 'open_short', status: 'success' });
@@ -421,6 +439,21 @@ export class FlashTradeClient {
         try {
             const collateralBN = new BN(Math.floor(collateralUsd * 1e6)); // 6 decimals for USDC
 
+            // Fetch fresh Pyth prices and create update instructions
+            // Required for Remora pool — oracle must be current or instruction is rejected with 6031
+            const flashSdk = await import('flash-sdk');
+            let pythUpdateInstructions: TransactionInstruction[] = [];
+            try {
+                const poolAddress = this.poolConfig.poolAddress?.toBase58();
+                pythUpdateInstructions = await flashSdk.createBackupOracleInstruction(poolAddress, true);
+            } catch (pythError) {
+                log.warn({
+                    event: 'pyth_backup_oracle_fetch_failed',
+                    error: pythError instanceof Error ? pythError.message : String(pythError),
+                    msg: 'Proceeding without Pyth update - may fail if oracle is stale',
+                });
+            }
+
             const { instructions, additionalSigners } = await this.perpClient.addCollateral(
                 collateralBN,
                 this.targetSymbol,
@@ -430,7 +463,8 @@ export class FlashTradeClient {
                 this.poolConfig,
             );
 
-            const txSignature = await this.buildAndSendTransaction(instructions, additionalSigners);
+            const allInstructions = [...pythUpdateInstructions, ...instructions];
+            const txSignature = await this.buildAndSendTransaction(allInstructions, additionalSigners);
 
             log.info({ event: 'collateral_added', txSignature, amount: collateralUsd.toFixed(2) });
             return { txSignature };
@@ -515,6 +549,23 @@ export class FlashTradeClient {
                 }
             }
 
+            // Fetch fresh Pyth prices and create update instructions
+            // Required for Remora pool — oracle must be current or instruction is rejected with 6031
+            const flashSdk = await import('flash-sdk');
+            let pythUpdateInstructions: TransactionInstruction[] = [];
+            try {
+                const poolAddress = this.poolConfig.poolAddress?.toBase58();
+                log.info({ event: 'fetching_pyth_backup_oracle', poolAddress });
+                pythUpdateInstructions = await flashSdk.createBackupOracleInstruction(poolAddress, true);
+                log.info({ event: 'pyth_update_instructions_created', count: pythUpdateInstructions.length });
+            } catch (pythError) {
+                log.warn({
+                    event: 'pyth_backup_oracle_fetch_failed',
+                    error: pythError instanceof Error ? pythError.message : String(pythError),
+                    msg: 'Proceeding without Pyth update - may fail if oracle is stale',
+                });
+            }
+
             // Step 2: Increase size
             const { instructions, additionalSigners } = await this.perpClient.increaseSize(
                 this.targetSymbol,
@@ -527,7 +578,9 @@ export class FlashTradeClient {
                 { none: {} } // Privilege
             );
 
-            const txSignature = await this.buildAndSendTransaction(instructions, additionalSigners);
+            // Prepend Pyth update instructions before the increase instruction
+            const allInstructions = [...pythUpdateInstructions, ...instructions];
+            const txSignature = await this.buildAndSendTransaction(allInstructions, additionalSigners);
 
             log.info({ event: 'short_position_increased', txSignature });
             txSubmittedCounter.inc({ type: 'increase_short', status: 'success' });
